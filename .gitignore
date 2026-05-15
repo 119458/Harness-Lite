@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+
+# Agent & IDE metadata
+.agents/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.egg-info/
+*.egg
+
+# Session memory (local dev)
+memory_store/
+
+# macOS
+.DS_Store
