@@ -1,15 +1,19 @@
-"""Loop engine module.
+"""
+Loop engine module.
 
-Core LLM loop engine that autonomously decides, calls tools, and verifies results.
+Core async LLM engine that provides infrastructure for strategies.
 """
 
 from typing import Dict, Any, List, Optional, Callable
-import requests
+import httpx
+import json
+import asyncio
 
 from harness_lite.memory.manager import MemoryManager
 from harness_lite.registry import tool_registry
 from harness_lite.security.manager import security_manager
 from harness_lite.config.loader import get_llm_config
+from harness_lite.loop.strategy import ReActStrategy
 
 
 SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成任务。
@@ -24,168 +28,70 @@ SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成任务�
 
 记住：
 - 所有工具调用必须提供完整的参数
-- 只有在真正需要时才调用工具
+- 当请求多个独立信息时，可以一次性输出多个工具调用
 """
 
-
-class LoopEngine:
-    """Core LLM loop engine with tool calling capability."""
-
-    def __init__(self, session_id: str = "default"):
+class AsyncLoopEngine:
+    """Core Async LLM Engine."""
+    def __init__(self, strategy=None):
         """
-        Initialize the loop engine.
-
+        Initialize the async engine.
         Args:
-            session_id: Session ID for memory management
+            strategy: 具体的执行策略，默认使用 ReActStrategy
         """
-        self.session_id = session_id
-        self._memory = MemoryManager()
-        self._security = security_manager
-        self._registry = tool_registry
+        self.strategy = strategy or ReActStrategy()
+        self.memory = MemoryManager()
+        self.security = security_manager
+        self.registry = tool_registry
 
-    def run(self, task: str, session_id: str, stream_callback: Callable[[str], None] = None) -> str:
+    async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None, status_callback: Callable[[str], None] = None) -> str:
         """
-        Execute a task with tool calling loop.
-
-        Args:
-            task: User input task
-            session_id: Session ID for memory context
-            stream_callback: Optional callback for streaming responses
-
-        Returns:
-            LLM generated response
+        委托给具体的 Strategy 来执行任务。
         """
-        self.session_id = session_id
-        self._stream_callback = stream_callback
+        return await self.strategy.execute(task, self, session_id, stream_callback, status_callback)
 
-        # Load historical context from memory
-        messages = self._memory.load_context(session_id)
-
-        # If no history, build messages with system prompt (including tools schema)
-        if not messages:
-            messages = self._build_messages(task)
-        else:
-            # Add user message to existing history
-            messages.append({"role": "user", "content": task})
-
-        # Tool call loop
-        max_iterations = 20
-        iteration = 0
-        full_response = ""
-
-        while iteration < max_iterations:
-            iteration += 1
-
-            # Call LLM with streaming if callback provided
-            is_streaming = stream_callback is not None
-            response = self._call_llm(messages, stream=is_streaming)
-
-            # Extract assistant message
-            assistant_message = response.get("choices", [{}])[0].get("message", {})
-            assistant_content = assistant_message.get("content", "") or ""
-            tool_calls = assistant_message.get("tool_calls") or []
-
-            # If there are tool calls, process them
-            if tool_calls:
-                # Add assistant message to history
-                messages.append({
-                    "role": "assistant",
-                    "content": assistant_content,
-                    "tool_calls": tool_calls
-                })
-
-                # Process tool calls
-                tool_results = self._process_tool_calls(tool_calls)
-
-                # Add tool results to messages
-                for result in tool_results:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": result.get("tool_call_id"),
-                        "content": result.get("output", str(result.get("error", "Unknown error")))
-                    })
-                # Continue to next iteration to get final response
-                continue
-
-            # No tool calls - this is the final response
-            if assistant_content:
-                messages.append({"role": "assistant", "content": assistant_content})
-                full_response += assistant_content
-
-            # Save context to memory before returning
-            self._memory.save_context(session_id, messages)
-            return full_response
-
-        # Max iterations reached
-        final_response = "已达到最大迭代次数，请稍后重试。"
-        messages.append({"role": "assistant", "content": final_response})
-        self._memory.save_context(session_id, messages)
-        return final_response
-
-    def _build_messages(self, task: str) -> List[Dict[str, str]]:
+    def build_initial_messages(self, task: str) -> List[Dict[str, str]]:
         """
-        Build message list for LLM.
-
-        Args:
-            task: User input
-
-        Returns:
-            Message list
+        构建初始系统消息
         """
         tools_schema = self._get_all_tools_schema()
-        system_content = SYSTEM_PROMPT.format(tools_schema=tools_schema)
-
+        system_content = SYSTEM_PROMPT.format(tools_schema=json.dumps(tools_schema, ensure_ascii=False))
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": task}
         ]
 
-    def _call_llm(self, messages: List[Dict[str, Any]], stream: bool = False) -> Dict[str, Any]:
+    async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None, status_callback=None) -> Dict[str, Any]:
         """
-        Call LLM API.
-
-        Args:
-            messages: Message list
-            stream: Whether to use streaming response
-
-        Returns:
-            LLM response
+        异步调用 LLM API
         """
         config = get_llm_config()
         tools = self._get_all_tools_schema()
-
-        if stream:
-            return self._call_llm_stream(messages, tools)
-        else:
-            response = requests.post(
-                f"{config['base_url']}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config['api_key']}",
-                    "Content-Type": "application/json"
-                },
-                json={
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            if stream:
+                return await self._call_llm_stream_async(client, config, messages, tools, stream_callback, status_callback)
+            else:
+                payload = {
                     "model": config["model_name"],
-                    "messages": messages,
-                    "tools": tools if tools else None
-                },
-                timeout=60
-            )
-            return response.json()
+                    "messages": messages
+                }
+                if tools:
+                    payload["tools"] = tools
 
-    def _call_llm_stream(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
+                response = await client.post(
+                    f"{config['base_url']}/chat/completions",
+                    headers={"Authorization": f"Bearer {config['api_key']}"},
+                    json=payload
+                )
+                return response.json()
+
+    async def _call_llm_stream_async(self, client, config, messages, tools, stream_callback, status_callback) -> Dict[str, Any]:
         """
-        Call LLM API with streaming response.
-
-        Args:
-            messages: Message list
-            tools: Tool schemas
-
-        Returns:
-            LLM response (reconstructed from stream)
+        异步流式请求处理
         """
-        config = get_llm_config()
         full_content = ""
         collected_tool_calls = []
+        notified_tool_call = False
 
         payload = {
             "model": config["model_name"],
@@ -195,65 +101,70 @@ class LoopEngine:
         if tools:
             payload["tools"] = tools
 
-        response = requests.post(
-            f"{config['base_url']}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {config['api_key']}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=60,
-            stream=True
-        )
+        async with client.stream(
+                "POST",
+                f"{config['base_url']}/chat/completions",
+                headers={"Authorization": f"Bearer {config['api_key']}"},
+                json=payload
+        ) as response:
+            if response.status_code != 200:
+                await response.aread()
+                error_msg = f"\n[API 请求失败] 状态码: {response.status_code}, 详情: {response.text}\n"
+                if stream_callback:
+                    stream_callback(error_msg)
+                return {"choices": [{"message": {"content": error_msg}}]}
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
 
-        for line in response.iter_lines():
-            if not line:
-                continue
-            line_text = line.decode('utf-8')
-            if line_text.startswith("data: "):
-                data = line_text[6:]
+                data = line[6:]
                 if data == "[DONE]":
                     break
+
                 try:
-                    import json
                     chunk = json.loads(data)
                     choices = chunk.get("choices", [])
                     if not choices:
                         continue
-                    delta = choices[0].get("delta", {})
 
-                    # Handle content delta
+                    delta = choices[0].get("delta", {})
                     content = delta.get("content", "")
+
                     if content:
                         full_content += content
-                        if self._stream_callback:
-                            self._stream_callback(content)
+                        if stream_callback:
+                            stream_callback(content)
 
-                    # Handle tool calls delta
+                    # 收集流式返回的 tool_calls
                     tc_deltas = delta.get("tool_calls", [])
+                    if tc_deltas:
+                        if not notified_tool_call:
+                            if status_callback:
+                                status_callback("[🧠 思考中] 模型决定调用外部能力，正在构造参数...")
+                            notified_tool_call = True
                     for tc_delta in tc_deltas:
                         index = tc_delta.get("index", 0)
                         while len(collected_tool_calls) <= index:
                             collected_tool_calls.append({"function": {}})
+                        if "id" in tc_delta:
+                            collected_tool_calls[index]["id"] = tc_delta["id"]
                         if "function" in tc_delta:
                             func_delta = tc_delta["function"]
                             if "name" in func_delta:
                                 collected_tool_calls[index]["function"]["name"] = func_delta["name"]
                             if "arguments" in func_delta:
-                                args = func_delta["arguments"]
                                 if "arguments" not in collected_tool_calls[index]["function"]:
                                     collected_tool_calls[index]["function"]["arguments"] = ""
-                                collected_tool_calls[index]["function"]["arguments"] += args
+                                collected_tool_calls[index]["function"]["arguments"] += func_delta["arguments"]
 
                 except json.JSONDecodeError:
                     continue
 
-        # Reconstruct tool calls in standard format
         tool_calls = []
         for tc in collected_tool_calls:
-            if "function" in tc:
+            if "function" in tc and tc["function"].get("name"):
                 tool_calls.append({
-                    "id": f"call_{id(tc)}",
+                    "id": tc.get("id", f"call_{id(tc)}"),
                     "function": tc["function"]
                 })
 
@@ -266,81 +177,73 @@ class LoopEngine:
             }]
         }
 
-    def _process_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _safe_execute_tool_wrapper(self, call_id: str, tool_name: str, arguments: Dict[str, Any], session_id: str) -> Dict[str, Any]:
         """
-        Process tool calls from LLM.
+        异步工具执行的包装器。
+        使用 asyncio.to_thread 防止同步的工具代码阻塞主事件循环，
+        并确保任何未知的极端异常都能被打包成返回结果，绝不导致框架崩溃。
+        """
+        try:
+            output = await asyncio.to_thread(self._execute_tool, tool_name, arguments, session_id)
+            return {"tool_call_id": call_id, "output": output}
+        except Exception as e:
+            return {"tool_call_id": call_id, "output": "", "error": f"[System Critical Error] 异步调度框架异常: {str(e)}"}
 
-        Args:
-            tool_calls: List of tool calls from LLM
-
-        Returns:
-            Tool execution results
+    async def process_tool_calls_async(self, tool_calls: List[Dict[str, Any]], session_id: str) -> List[Dict[str, Any]]:
+        """
+        异步处理工具调用，增强 JSON 容错与并发执行
         """
         results = []
-
-        for tool_call in tool_calls:
+        tasks = []
+        valid_tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
+        for tool_call in valid_tool_calls:
             call_id = tool_call.get("id", f"call_{id(tool_call)}")
             func = tool_call.get("function", {})
             tool_name = func.get("name", "")
             arguments = func.get("arguments", "{}")
 
-            # Parse arguments if string
             if isinstance(arguments, str):
-                import json
                 try:
                     arguments = json.loads(arguments)
-                except json.JSONDecodeError:
-                    results.append({
-                        "tool_call_id": call_id,
-                        "output": "",
-                        "error": f"Invalid arguments JSON: {arguments}"
-                    })
+                except json.JSONDecodeError as e:
+                    error_msg = f"JSON解析失败: 无法解析参数 '{arguments}'。原因: {str(e)}。请检查是否缺失括号、引号转义是否正确，并重新输出合法的 JSON 参数。"
+                    results.append({"tool_call_id": call_id, "output": "", "error": error_msg})
                     continue
-
-            # Execute tool
-            output = self._execute_tool(tool_name, arguments)
-            results.append({
-                "tool_call_id": call_id,
-                "output": output
-            })
-
+            task = asyncio.create_task(
+                self._safe_execute_tool_wrapper(call_id, tool_name, arguments, session_id)
+            )
+            tasks.append(task)
+        if tasks:
+            # 使用 return_exceptions=True 是并行的安全底线
+            # 即使其中一个线程崩溃，其他任务的结果依然会被保留
+            completed_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in completed_results:
+                if isinstance(res, Exception):
+                    results.append({"tool_call_id": "unknown", "output": "", "error": f"Task Failed: {str(res)}"})
+                else:
+                    results.append(res)
         return results
 
-    def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> str:
+    def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any], session_id: str) -> str:
         """
-        Execute a single tool with security intercept.
-
-        Args:
-            tool_name: Tool name
-            tool_args: Tool arguments
-
-        Returns:
-            Tool execution result
+        执行单一工具,增强异常反馈
         """
-        # Security intercept
-        allowed, error_msg = self._security.intercept(tool_name, tool_args, self.session_id)
-
+        allowed, error_msg = self.security.intercept(tool_name, tool_args, session_id)
         if not allowed:
-            return f"Security blocked: {error_msg}"
-
-        # Get tool from registry
-        tool = self._registry.get(tool_name)
-
+            return f"[Security Blocked] 安全拦截: {error_msg}。请更换策略。"
+        tool = self.registry.get(tool_name)
         if tool is None:
-            return f"Tool '{tool_name}' not found"
+            return f"[Tool Not Found] 工具 '{tool_name}' 不存在，请检查并使用系统提供的工具名称。"
 
-        # Execute tool
         try:
+            # 兼容现有的同步 Tool execute，后续可扩展 await tool.execute_async()
             result = tool.execute(**tool_args)
             return str(result)
         except Exception as e:
-            return f"Tool execution error: {str(e)}"
+            import traceback
+            error_stack = traceback.format_exc().strip().split("\n")[-2:]
+            stack_str = ' '.join(error_stack)
+            return f"[Execution Error] 工具执行时抛出代码异常: {str(e)}。详细信息: {stack_str}。请根据报错信息更换参数或改用其他方法。"
 
     def _get_all_tools_schema(self) -> List[Dict[str, Any]]:
-        """
-        Get schemas for all registered tools.
-
-        Returns:
-            List of tool schemas
-        """
-        return self._registry.get_all_schemas()
+        return self.registry.get_all_schemas()

@@ -4,11 +4,14 @@ Command-line interface for the Harness-Lite multi-agent framework.
 """
 import sys
 import time
+from cgitb import handler
+
 import typer
+import asyncio
 from typing import Optional
 
 from harness_lite.config import get_llm_config
-from harness_lite.loop import LoopEngine
+from harness_lite.loop import AsyncLoopEngine
 from harness_lite.memory import MemoryManager
 
 # Import tools and skills to trigger auto-registration
@@ -26,12 +29,78 @@ def generate_session_id() -> str:
     timestamp = int(time.time())
     return f"session-{timestamp}"
 
+# 终端渲染拦截器
+class CLIOutputHandler:
+    def __init__(self):
+        self.status_lines = []
+        self.status_printed_count = 0
+        self.prompt_printed = False
+
+    def stream_callback(self, content: str):
+        # 1. 擦除最后残留的状态日志（精确擦除）
+        if self.status_printed_count > 0:
+            for _ in range(self.status_printed_count):
+                # \r 回到行首, \033[1A 上移一行, \033[2K 清空整行
+                sys.stdout.write("\r\033[1A\033[2K")
+            self.status_printed_count = 0
+            self.status_lines.clear()
+
+        # 2. 打印头部提示符（确保全局只打印一次）
+        if not self.prompt_printed:
+            sys.stdout.write("\rHarness-Lite > ")
+            self.prompt_printed = True
+
+        # 3. 输出大模型真正的回答内容
+        for char in content:
+            sys.stdout.write(char)
+            sys.stdout.flush()
+            time.sleep(0.015)
+
+    def status_callback(self, content: str):
+        # 终极防御 1：强制剥离所有可能破坏格式的换行符，保证一行文本只占终端的一行
+        clean_line = content.replace("\n", "").replace("\r", "").strip()
+        if not clean_line:
+            return
+
+        # 终极防御 2：精确擦除旧的状态列表
+        if self.status_printed_count > 0:
+            for _ in range(self.status_printed_count):
+                sys.stdout.write("\r\033[1A\033[2K")
+
+        # 维持最多 5 行的滚动窗口
+        self.status_lines.append(clean_line)
+        if len(self.status_lines) > 5:
+            self.status_lines.pop(0)
+
+        # 重新打印最新的状态列表
+        for line in self.status_lines:
+            # 渲染成灰色并换行
+            sys.stdout.write(f"\r\033[2K\033[90m{line}\033[0m\n")
+
+        self.status_printed_count = len(self.status_lines)
+        sys.stdout.flush()
+
 
 def stream_output(content: str) -> None:
     """Stream output to stdout without newline, flush immediately."""
     sys.stdout.write(content)
     sys.stdout.flush()
 
+async def run_loop_async(task: str, session_id: str, stream: bool = True) -> str:
+    """
+    Async core for running the loop.
+    """
+    engine = AsyncLoopEngine()
+    if stream:
+        handler = CLIOutputHandler()
+        return await engine.run(
+            task,
+            session_id,
+            stream_callback=handler.stream_callback,
+            status_callback=handler.status_callback
+        )
+    else:
+        return await engine.run(task, session_id)
 
 def run_loop(task: str, session_id: str, stream: bool = True) -> str:
     """
@@ -45,9 +114,7 @@ def run_loop(task: str, session_id: str, stream: bool = True) -> str:
     Returns:
         LLM response
     """
-    engine = LoopEngine(session_id=session_id)
-    callback = stream_output if stream else None
-    return engine.run(task, session_id, stream_callback=callback)
+    return asyncio.run(run_loop_async(task, session_id, stream))
 
 
 @app.command()
@@ -117,7 +184,7 @@ def run_interactive(session_id: str) -> None:
     Args:
         session_id: Session ID for memory management
     """
-    typer.echo(f"Harness-Lite > 你好！有什么可以帮你的？")
+    # typer.echo(f"Harness-Lite > 你好！有什么可以帮你的？")
     typer.echo(f"(当前会话: {session_id}, 输入 'exit' 退出)")
 
     while True:
@@ -135,7 +202,7 @@ def run_interactive(session_id: str) -> None:
             continue
 
         # Print prompt
-        typer.echo("Harness-Lite > ", nl=False)
+        # typer.echo("Harness-Lite > ", nl=False)
 
         # Run the task with streaming
         response = run_loop(user_input, session_id, stream=True)

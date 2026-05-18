@@ -13,6 +13,12 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - **安全拦截**：权限校验、输入验证与审计日志
 - **LLM 编排**：流式响应、工具调用循环与对话历史管理
 
+## 循环编排功能优化(2026-5-18)
+- **异步并发调度 (Async Parallel Dispatch)**：基于 `asyncio` 与大模型 Parallel Tool Calling 能力，支持在同一回合内并发执行多个独立工具，极大降低网络 I/O 耗时。
+- **自省容错与熔断 (Error Recovery & Circuit Breaker)**：内置大模型 JSON 格式纠错重试、工具执行异常隔离与反馈引擎，以及达到最大推理步数后的系统级熔断保护。
+- **沉浸式终端交互 (Immersive CLI UI)**：终端内置滚动状态指示器（平滑展示大模型思考与工具并行的中间态日志），并配备打字机式丝滑流式输出。
+- **策略模式编排 (Strategy Orchestration)**：解耦底层引擎与编排逻辑，内置高度容错的 `ReActStrategy`，可轻松扩展至图驱动 (Graph) 或 Plan-and-Execute 等复杂流转模式。
+
 ## 架构
 
 ```

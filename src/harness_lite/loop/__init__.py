@@ -1,5 +1,6 @@
 """Loop module for core LLM engine."""
 
-from .engine import LoopEngine
+from .engine import AsyncLoopEngine
+from .strategy import ReActStrategy
 
-__all__ = ["LoopEngine"]
+__all__ = ["AsyncLoopEngine", "ReActStrategy"]
