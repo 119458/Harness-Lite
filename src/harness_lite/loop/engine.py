@@ -11,20 +11,27 @@ import asyncio
 
 from harness_lite.memory.manager import MemoryManager
 from harness_lite.registry import tool_registry
+from harness_lite.registry import skill_registry
 from harness_lite.security.manager import security_manager
 from harness_lite.config.loader import get_llm_config
 from harness_lite.loop.strategy import ReActStrategy
 
 
+
 SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成任务。
 
-可用工具：
+【可用物理工具】
 {tools_schema}
 
+【可用业务技能 / SOP 指南手册】
+以下是你目前掌握的特定领域专业规范目录。如果你需要处理相关任务，请先调用 `read_skill` 工具查阅对应的详细规范手册：
+{skills_list}
+
 当你需要完成一个任务时：
-1. 如果可以直接回答，直接回复
-2. 如果需要调用工具，使用 tool_calls 格式
-3. 完成工具调用后，根据结果回复用户
+1. 先检查该任务是否涉及上述业务技能。如果涉及，请先调用 `read_skill` 工具学习其详细 SOP 规范。
+2. 如果可以直接回答，直接回复。
+3. 如果需要调用外部物理工具，使用 tool_calls 格式。
+4. 完成工具调用后，根据结果回复用户。
 
 记住：
 - 所有工具调用必须提供完整的参数
@@ -55,7 +62,20 @@ class AsyncLoopEngine:
         构建初始系统消息
         """
         tools_schema = self._get_all_tools_schema()
-        system_content = SYSTEM_PROMPT.format(tools_schema=json.dumps(tools_schema, ensure_ascii=False))
+        all_skills = skill_registry.list_all()
+        if all_skills:
+            lines = []
+            for s in all_skills:
+                s_name = s.name if hasattr(s, 'name') else s.get('name', '')
+                s_desc = s.description if hasattr(s, 'description') else s.get('description', '')
+                lines.append(f"- 技能名称: `{s_name}` | 简介: {s_desc}")
+            skills_list_str = "\n".join(lines)
+        else:
+            skills_list_str = "当前未加载任何特定的业务技能指南。"
+        system_content = SYSTEM_PROMPT.format(
+            tools_schema=json.dumps(tools_schema, ensure_ascii=False),
+            skills_list=skills_list_str
+        )
         return [
             {"role": "system", "content": system_content},
             {"role": "user", "content": task}
@@ -100,12 +120,15 @@ class AsyncLoopEngine:
         }
         if tools:
             payload["tools"] = tools
-
+        payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8", errors="replace")
         async with client.stream(
                 "POST",
                 f"{config['base_url']}/chat/completions",
-                headers={"Authorization": f"Bearer {config['api_key']}"},
-                json=payload
+                headers={
+                    "Authorization": f"Bearer {config['api_key']}",
+                    "Content-Type": "application/json"
+                },
+                content=payload_bytes
         ) as response:
             if response.status_code != 200:
                 await response.aread()
