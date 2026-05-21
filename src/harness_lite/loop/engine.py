@@ -3,7 +3,7 @@ Loop engine module.
 
 Core async LLM engine that provides infrastructure for strategies.
 """
-
+import os
 from typing import Dict, Any, List, Optional, Callable
 import httpx
 import json
@@ -18,10 +18,17 @@ from harness_lite.loop.strategy import ReActStrategy
 
 
 
-SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成任务。
+
+SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂的系统任务。
+
+【环境与沙箱状态】
+- 当前工作区（沙箱）绝对路径: {workspace_root}
+- 安全限制: 你的所有文件读取、创建、编辑以及终端操作，都必须严格限制在上述工作区范围内。系统已开启沙箱拦截，任何试图访问该目录之外（如 /etc, ~/.ssh 等）的操作都会被强制拒绝。
+- 路径建议: 在调用文件工具（如 create_file, edit_file）或终端执行时，请优先使用**相对于当前工作区的相对路径**（例如直接使用 `src/main.py` 而不是绝对路径）。
 
 【可用物理工具】
 {tools_schema}
+当使用 edit_file 时，请必须先使用 read_file 查阅目标文件的具体行号，然后精确提供 start_line 和 end_line 进行局部替换。
 
 【可用业务技能 / SOP 指南手册】
 以下是你目前掌握的特定领域专业规范目录。如果你需要处理相关任务，请先调用 `read_skill` 工具查阅对应的详细规范手册：
@@ -29,13 +36,9 @@ SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成任务�
 
 当你需要完成一个任务时：
 1. 先检查该任务是否涉及上述业务技能。如果涉及，请先调用 `read_skill` 工具学习其详细 SOP 规范。
-2. 如果可以直接回答，直接回复。
-3. 如果需要调用外部物理工具，使用 tool_calls 格式。
+2. 明确你要操作的文件路径，确保它在工作区沙箱内。
+3. 如果可以直接回答，直接回复；如果需要调用外部物理工具，使用 tool_calls 格式。
 4. 完成工具调用后，根据结果回复用户。
-
-记住：
-- 所有工具调用必须提供完整的参数
-- 当请求多个独立信息时，可以一次性输出多个工具调用
 """
 
 class AsyncLoopEngine:
@@ -72,7 +75,9 @@ class AsyncLoopEngine:
             skills_list_str = "\n".join(lines)
         else:
             skills_list_str = "当前未加载任何特定的业务技能指南。"
+        sandbox_absolute_path = str(self.security.workspace_root)
         system_content = SYSTEM_PROMPT.format(
+            workspace_root=sandbox_absolute_path,
             tools_schema=json.dumps(tools_schema, ensure_ascii=False),
             skills_list=skills_list_str
         )
@@ -83,31 +88,46 @@ class AsyncLoopEngine:
 
     async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None, status_callback=None) -> Dict[str, Any]:
         """
-        异步调用 LLM API
+        异步调用 LLM API 带有指数退避的重试机制 (Exponential Backoff Retry)
         """
         config = get_llm_config()
         tools = self._get_all_tools_schema()
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            if stream:
-                return await self._call_llm_stream_async(client, config, messages, tools, stream_callback, status_callback)
-            else:
-                payload = {
-                    "model": config["model_name"],
-                    "messages": messages
-                }
-                if tools:
-                    payload["tools"] = tools
+        max_retries = 3
+        base_wait = 2
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    if stream:
+                        return await self._call_llm_stream_async(client, config, messages, tools, stream_callback, status_callback)
+                    else:
+                        payload = {
+                            "model": config["model_name"],
+                            "messages": messages
+                        }
+                        if tools:
+                            payload["tools"] = tools
 
-                response = await client.post(
-                    f"{config['base_url']}/chat/completions",
-                    headers={"Authorization": f"Bearer {config['api_key']}"},
-                    json=payload
-                )
-                return response.json()
+                        response = await client.post(
+                            f"{config['base_url']}/chat/completions",
+                            headers={"Authorization": f"Bearer {config['api_key']}"},
+                            json=payload
+                        )
+                        response.raise_for_status()
+                        return response.json()
+            except(httpx.RequestError, httpx.HTTPStatusError) as e:
+                if attempt == max_retries - 1:
+                    error_msg = f"\n[API 致命错误] 网络请求失败且重试耗尽。状态: {str(e)}\n"
+                    if stream_callback:
+                        stream_callback(error_msg)
+                    return {"choices": [{"message": {"content": error_msg}}]}
+                wait_time = base_wait * (2 ** attempt)
+                if stream_callback:
+                    status_callback(f"[🔁 网络抖动] API 调用异常 ({str(e)})，将在 {wait_time} 秒后进行第 {attempt + 1} 次重试...")
+                await asyncio.sleep(wait_time)
 
     async def _call_llm_stream_async(self, client, config, messages, tools, stream_callback, status_callback) -> Dict[str, Any]:
         """
-        异步流式请求处理
+        异步流式请求处理 (增加抛出异常以便外层进行重试)
         """
         full_content = ""
         collected_tool_calls = []
@@ -130,6 +150,7 @@ class AsyncLoopEngine:
                 },
                 content=payload_bytes
         ) as response:
+            response.raise_for_status()
             if response.status_code != 200:
                 await response.aread()
                 error_msg = f"\n[API 请求失败] 状态码: {response.status_code}, 详情: {response.text}\n"
@@ -183,9 +204,23 @@ class AsyncLoopEngine:
                 except json.JSONDecodeError:
                     continue
 
+        def sanitize_text(text: str) -> str:
+            if not text:
+                return text
+            try:
+                text = text.encode("utf-16", "surrogatepass").decode('utf-16')
+                text = text.encode('utf-8', 'replace').decode('utf-8')
+            except Exception:
+                pass
+            return text
+
+        full_content = sanitize_text(full_content)
+
         tool_calls = []
         for tc in collected_tool_calls:
             if "function" in tc and tc["function"].get("name"):
+                args = tc["function"].get("arguments", "")
+                tc["function"]["arguments"] = sanitize_text(args)
                 tool_calls.append({
                     "id": tc.get("id", f"call_{id(tc)}"),
                     "function": tc["function"]
@@ -214,10 +249,10 @@ class AsyncLoopEngine:
 
     async def process_tool_calls_async(self, tool_calls: List[Dict[str, Any]], session_id: str) -> List[Dict[str, Any]]:
         """
-        异步处理工具调用，增强 JSON 容错与并发执行
+        异步处理工具调用：已修复并发竞态条件 (Race Condition) 漏洞
+        采用严格顺序执行与 Fail-Fast (快速失败) 策略。
         """
         results = []
-        tasks = []
         valid_tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
         for tool_call in valid_tool_calls:
             call_id = tool_call.get("id", f"call_{id(tool_call)}")
@@ -232,19 +267,16 @@ class AsyncLoopEngine:
                     error_msg = f"JSON解析失败: 无法解析参数 '{arguments}'。原因: {str(e)}。请检查是否缺失括号、引号转义是否正确，并重新输出合法的 JSON 参数。"
                     results.append({"tool_call_id": call_id, "output": "", "error": error_msg})
                     continue
-            task = asyncio.create_task(
-                self._safe_execute_tool_wrapper(call_id, tool_name, arguments, session_id)
-            )
-            tasks.append(task)
-        if tasks:
-            # 使用 return_exceptions=True 是并行的安全底线
-            # 即使其中一个线程崩溃，其他任务的结果依然会被保留
-            completed_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for res in completed_results:
-                if isinstance(res, Exception):
-                    results.append({"tool_call_id": "unknown", "output": "", "error": f"Task Failed: {str(res)}"})
-                else:
-                    results.append(res)
+
+            res = await self._safe_execute_tool_wrapper(call_id, tool_name, arguments, session_id)
+            results.append(res)
+            if res.get("error") or str(res.get("output", "")).startswith(("[Security", "[Error", "Failed")):
+                results.append({
+                    "tool_call_id": "system_interrupt",
+                    "output": "",
+                    "error": f"[System] 检测到前置工具 '{tool_name}' 执行失败，出于安全与逻辑依赖考虑，系统已自动取消同批次尚未执行的后续工具调用。请先修复上述错误。"
+                })
+                break
         return results
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any], session_id: str) -> str:

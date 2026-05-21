@@ -46,7 +46,7 @@ class MemoryStore:
             messages: List of message dictionaries
         """
         file_path = self._get_file_path(session_id)
-        with open(file_path, "w", encoding="utf-8") as f:
+        with open(file_path, "w", encoding="utf-8", errors="replace") as f:
             json.dump(messages, f, ensure_ascii=False, indent=2)
 
     def load(self, session_id: str) -> List[Dict[str, Any]]:

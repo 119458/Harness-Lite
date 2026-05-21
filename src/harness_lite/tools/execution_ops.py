@@ -1,35 +1,103 @@
 import os
 import subprocess
 import tempfile
+import threading
+import queue
+import time
+import uuid
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
+
 from harness_lite.tools.base import BaseTool
+from harness_lite.security.manager import security_manager
+
+class PersistentShell:
+    """
+    底层持久化 Shell，保持持续的上下文 (CWD, ENV) 状态，防止发生进程死锁
+    """
+
+    def __init__(self, cwd: str):
+        # 启动一个常驻的 bash 进程，合并 stdout 和 stderr
+        self.process = subprocess.Popen(
+            ['bash'],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1
+        )
+        self.output_queue = queue.Queue()
+        self.thread = threading.Thread(target=self._read_output, daemon=True)
+        self.thread.start()
+
+    def _read_output(self):
+        for line in iter(self.process.stdout.readline, ''):
+            self.output_queue.put(line)
+
+    def execute(self, command: str, timeout: int = 15) -> Tuple[str, int]:
+        while not self.output_queue.empty():
+            try:
+                self.output_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # 注入唯一结束符与退出码，以便我们知道命令何时执行完毕
+        marker = f"__EOC_{uuid.uuid4().hex}__"
+        full_cmd = f"{command}\necho {marker} $?\n"
+
+        self.process.stdin.write(full_cmd)
+        self.process.stdin.flush()
+
+        output_lines = []
+        exit_code = 0
+        start_time = time.time()
+
+        while True:
+            if time.time() - start_time > timeout:
+                self.process.send_signal(subprocess.signal.SIGINT)
+                return "".join(output_lines) + f"\n\n[Timeout] 执行超过 {timeout} 秒被强制中断。", -1
+
+            try:
+                line = self.output_queue.get(timeout=0.1)
+                if marker in line:
+                    parts = line.strip().split()
+                    if parts:
+                        try:
+                            exit_code = int(parts[-1])
+                        except ValueError:
+                            pass
+                    break
+                output_lines.append(line)
+            except queue.Empty:
+                continue
+        return "".join(output_lines), exit_code
 
 class BashTerminalTool(BaseTool):
     """
-    受控的终端 Shell 执行器
+    有记忆的持久化终端执行器
     """
+
     @property
-    def name(self) -> str:
-        return "bash_terminal"
+    def name(self) -> str: return "bash_terminal"
+
     @property
     def description(self) -> str:
-        return "执行标准的终端 Shell 命令。自带目录状态记忆（支持 cd 命令）。适用于运行测试、查看系统状态或安装依赖。注意：长耗时命令会被自动强制中断。"
+        return "执行标准的终端 Shell 命令。自带环境状态记忆，export 变量和 cd 目录切换会持续生效。请优先使用此工具运行代码、查看系统或安装依赖。"
 
-    def __init__(self, timeout: int = 15):
+    def __init__(self, timeout: int = 20):
         super().__init__()
         self.timeout = timeout
-        # 初始化状态：记录当前工作目录，确保多次调用工具时上下文连贯
-        self.current_working_dir = os.getcwd()
-        # 作为最后一道防线的内置黑名单（更复杂的鉴权应在 SecurityManager 中进行）
-        self.blacklist = ['rm -rf /', 'mkfs', 'sudo']
+        self.shell = PersistentShell(cwd=str(security_manager.workspace_root))
 
     def get_schema(self) -> Dict[str, Any]:
         schema = super().get_schema()
         schema["function"]["parameters"]["properties"] = {
             "command": {
                 "type": "string",
-                "description": "要执行的 shell 命令，例如 'ls -la', 'python test.py', 'cd src' 等"
+                "description": "要执行的 bash 命令"
             }
         }
         schema["function"]["parameters"]["required"] = ["command"]
@@ -40,51 +108,18 @@ class BashTerminalTool(BaseTool):
         if not command:
             return "Error: 接收到了空命令。"
 
-        for blocked in self.blacklist:
-            if blocked in command:
-                return f"Security Error: 命令触碰了底层安全策略，包含高危指令 '{blocked}' 被拦截。"
+        output, exit_code = self.shell.execute(command, timeout=self.timeout)
 
-        if command.startswith("cd") or command == "cd":
-            target_dir = command[3:].strip()
-            if not target_dir or target_dir == "~":
-                target_dir = os.path.expanduser("~")
+        # 截断超长输出，保护上下文
+        if len(output) > 2500:
+            output = output[:2500] + "\n...[输出过长，已被截断]..."
 
-            new_path = Path(self.current_working_dir) / target_dir
-            resolved_path = new_path.resolve()
-
-            if resolved_path.exists() and resolved_path.is_dir():
-                self.current_working_dir = str(resolved_path)
-                return f"Success: 已将当前工作目录切换至 {self.current_working_dir}"
-            else:
-                return f"Error: 目录 '{target_dir}' 不存在。"
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=self.current_working_dir,
-                capture_output=True,
-                timeout=self.timeout
-            )
-            output_parts = []
-            if result.stdout:
-                stdout_text = result.stdout[:2000] + "\n...[输出被截断]" if len(result.stdout) > 2000 else result.stdout
-                output_parts.append(f"STDOUT:\n{stdout_text.strip()}")
-            if result.stderr:
-                stderr_text = result.stderr[:2000] + "\n...[输出被截断]" if len(result.stderr) > 2000 else result.stderr
-                output_parts.append(f"STDERR:\n{stderr_text.strip()}")
-            combined_output = "\n".join(output_parts)
-
-            if result.returncode == 0:
-                return f"Success (Exit code: 0):\n{combined_output}" if combined_output else "Success: 命令执行完毕，无输出。"
-            else:
-                return f"Failed (Exit code: {result.returncode}):\n{combined_output}"
-
-        except subprocess.TimeoutExpired:
-            return (f"Error: 命令执行超过了最大时限 ({self.timeout}秒) 被强制中断。\n"
-                    f"如果是启动服务器类型的命令（如 npm run dev），请将其作为后台任务运行或只将其用于测试。")
-        except Exception as e:
-            return f"System Error: {str(e)}"
+        if exit_code == 0:
+            return f"Success (Exit 0):\n{output.strip()}" if output.strip() else "Success: 命令执行完毕，无输出。"
+        elif exit_code == -1:
+            return f"Failed: 命令执行超时。\n{output.strip()}"
+        else:
+            return f"Failed (Exit {exit_code}):\n{output.strip()}"
 
 class PythonInterpreterTool(BaseTool):
     """

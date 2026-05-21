@@ -3,7 +3,7 @@ Strategy module for agent execution flow.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, List, Dict
 
 class BaseStrategy(ABC):
     """编排策略基类"""
@@ -16,10 +16,33 @@ class BaseStrategy(ABC):
         pass
 
 class ReActStrategy(BaseStrategy):
-    """基础的ReAct（Reason-Act）循环策略"""
+    """健壮的 ReAct 循环策略，自带上下文保护与熔断机制"""
 
-    def __init__(self, max_steps: int = 10):
+    def __init__(self, max_steps: int = 15, max_context_length: int = 12):
         self.max_steps = max_steps
+        self.max_context_length = max_context_length
+
+    def _prune_context(self, messages: List[Dict[str, Any]], status_callback: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
+        """
+        安全地修剪上下文：滑动窗口机制
+        必须保证 OpenAI 格式的严格性：'tool' 角色消息不能失去对应的 'assistant' (tool_calls) 消息。
+        """
+        if len(messages) <= self.max_context_length:
+            return messages
+
+        core_context = messages[:2]
+        recent_context = []
+
+        idx = len(messages) - 1
+        while idx >= 2 and len(recent_context) < (self.max_context_length - 2):
+            recent_context.insert(0, messages[idx])
+            idx -= 1
+        while recent_context and recent_context[0].get("role") == "tool":
+            recent_context.pop(0)
+        if status_callback and len(messages) != len(core_context + recent_context):
+            status_callback("[🧹 内存优化] 历史会话过长，已自动折叠早期的工具执行日志，释放上下文空间。")
+
+        return core_context + recent_context
 
     async def execute(self, task: str, engine: Any, session_id: str, stream_callback: Optional[Callable[[str], None]] = None, status_callback: Optional[Callable[[str], None]] = None) -> str:
         # 1. 组装初始化上下文
@@ -36,6 +59,7 @@ class ReActStrategy(BaseStrategy):
         while step < self.max_steps:
             step += 1
 
+            messages = self._prune_context(messages, status_callback)
             # 步骤A：推理（调用LLM）
             is_streaming = stream_callback is not None
             response = await engine.call_llm_async(messages, is_streaming, stream_callback=stream_callback, status_callback=status_callback)
@@ -71,16 +95,19 @@ class ReActStrategy(BaseStrategy):
                     if error_val:
                         content = error_val
                         has_error_in_this_step = True
-                    elif output_val.startswith("[Security") or output_val.startswith("[Tool Not") or output_val.startswith("[Execution Error]"):
+                    elif str(output_val).startswith("[Security") or str(output_val).startswith("[Tool Not") or str(output_val).startswith("[Execution Error]"):
                         content = output_val
                         has_error_in_this_step = True
                     else:
-                        content = output_val
+                        content = str(output_val)
+                    MAX_TOOL_OUTPUT_LEN = 4000
+                    if len(content) > MAX_TOOL_OUTPUT_LEN:
+                        content = content[:MAX_TOOL_OUTPUT_LEN] + f"\n\n...[内容过长: 剩余 {len(content) - MAX_TOOL_OUTPUT_LEN} 字符已被系统强制截断以保护上下文]..."
 
                     messages.append({
                         "role": "tool",
                         "tool_call_id": result.get("tool_call_id"),
-                        "content": result.get("output", str(result.get("error", "Unknown error")))
+                        "content": content
                     })
                 if has_error_in_this_step:
                     consecutive_errors += 1
@@ -116,7 +143,7 @@ class ReActStrategy(BaseStrategy):
 
         # 步骤 E：达到最大步数
         if step >= self.max_steps:
-            final_response = "\n[系统提示] 已达到最大思考步数，停止执行。"
+            final_response = f"\n[系统提示] 已达到最大思考步数限制 ({self.max_steps}步)，强制停止执行以防死循环。"
             if stream_callback:
                 stream_callback(final_response)
             messages.append({"role": "assistant", "content": final_response})
