@@ -26,6 +26,16 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 增加了skill技能工具
 - 详细信息查看function_description中的tool-skill-2026-5-19.md
 
+## 🚀 [2026-05-26] 构建security和memory
+- 建立3级审查安全，当不通过时交由人工判断
+- 建立短期记忆和长期记忆（md文件）
+- 上下文智能压缩，先压缩工具调用 -> 早期记忆(默认上下午64k)
+- 模型调用由之前的httpx换位openai
+- 将模型输出有误的content进行处理，确保其不影响下次的模型对话使用
+- 测试
+  生成一个贪吃蛇程序并运行，其会在规定的沙箱环境中生成一份py代码并在创建的子进程上调用程序
+  可以成功调用crate，edit，bash等工具。
+
 ## 架构
 
 ```

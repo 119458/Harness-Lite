@@ -1,5 +1,4 @@
-"""
-Memory manager module.
+"""Memory manager module.
 
 Provides unified interface for managing both short-term JSON chat histories
 and Claude Code-style long-term Markdown auto-memories.
@@ -10,51 +9,41 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 from datetime import datetime
-import httpx
+
+# 【核心替换点】引入官方 OpenAI 同步客户端，斩断 httpx 依赖
+from openai import OpenAI
 
 from .store import MemoryStore
 from harness_lite.config.loader import get_llm_config
 
 logger = logging.getLogger("harness_lite.memory")
 
-class MemoryManager:
-    """
-    分层记忆管理器：统管短期 JSON 聊天流与长期自愈型 Markdown 备忘录
-    """
-    def __init__(self, store_dir: str = "./memory_store"):
-        """
-        初始化记忆管理器
-        Args:
-            store_dir: 记忆存储的根目录
-        """
 
+class MemoryManager:
+    """分层记忆管理器：统管短期 JSON 聊天流与长期自愈型 Markdown 备忘录"""
+
+    def __init__(self, store_dir: str = "./memory_store"):
         self.base_dir = Path(store_dir).resolve()
         self.base_dir.mkdir(parents=True, exist_ok=True)
-
         self._store = MemoryStore(store_dir=str(self.base_dir))
 
         self.global_pref_file = self.base_dir / "global_preferences.md"
         self._init_global_preferences()
 
     def _init_global_preferences(self) -> None:
-        """
-        初始化全局用户偏好 Markdown 模板文件
-        """
         if not self.global_pref_file.exists():
             content = """# 全局用户开发偏好与习惯交互表 (Global Preferences)
 - 在开始编写大规模核心代码前，优先输出一份简明的架构设计草案供用户确认。
 - 保持回答和日志信息简明扼要，直接展示核心代码块，避免冗长的寒暄。
 - 绝不在未经用户授权的情况下尝试读取沙箱外部的任何系统级敏感配置文件。
 """
-            self.global_pref_file.write_text(content)
+            self.global_pref_file.write_text(content, encoding="utf-8")
 
     def _get_session_memory_paths(self, session_id: str) -> Tuple[Path, Path, Path]:
         """
         获取长期记忆文件的存放路径。
-        【工程升级】：将原本绑定动态 session_id 的隔离设计，升级为持久化项目区，
-        使得跨日期的 session-时间戳.json 历史能够共享同一套进化备忘录。
+        解耦动态会话，开辟长效项目级永久累积区，支持跨会话历史共享一套进化备忘录。
         """
-        # 独立于按天轮转的 JSON 流水，开辟长效永久累积区
         persistent_dir = self.base_dir / "persistent_memory"
         auto_mem_dir = persistent_dir / "auto_memory"
         auto_mem_dir.mkdir(parents=True, exist_ok=True)
@@ -63,40 +52,29 @@ class MemoryManager:
         memory_md = auto_mem_dir / "MEMORY.md"
 
         if not claude_md.exists():
-            claude_md.write_text("# 项目开发显式规范手册\n- 技术栈规范: 优先采用标准库与异步架构模式。\n",
-                                 encoding="utf-8")
+            claude_md.write_text("# 项目开发显式规范手册\n- 技术栈规范: 优先采用标准库与异步架构模式。\n", encoding="utf-8")
         if not memory_md.exists():
-            memory_md.write_text(
-                "# 智能体自主学习与动态纠错经验记忆库 (Auto-Memory)\n> 本文件记录用户人工驳回的教训与自愈准则。\n\n## 经过验证的行为准则与惩罚记忆：\n",
-                encoding="utf-8")
+            memory_md.write_text("# 智能体自主学习与动态纠错经验记忆库 (Auto-Memory)\n> 本文件记录用户人工驳回的教训与自愈准则。\n\n## 经过验证的行为准则与惩罚记忆：\n", encoding="utf-8")
 
         return persistent_dir, claude_md, memory_md
 
+    # ==========================================
+    # 接口一：短期 JSON 线性工作上下文操作 (向前兼容)
+    # ==========================================
+
     def save_context(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
-        """
-        保存全量结构化会话 JSON 历史
-        """
         self._store.save(session_id, messages)
 
     def load_context(self, session_id: str) -> List[Dict[str, Any]]:
-        """
-        读取全量结构化会话 JSON 历史
-        """
         return self._store.load(session_id)
 
     def trim_history(self, session_id: str, keep_last_n: int) -> None:
-        """
-        裁剪高频会话历史，防止 Token 溢出
-        """
         messages = self._store.load(session_id)
         if len(messages) > keep_last_n:
             trimmed = messages[-keep_last_n:]
             self._store.save(session_id, trimmed)
 
     def clear_context(self, session_id: str) -> None:
-        """
-        清理租户对应的所有会话记忆
-        """
         self._store.delete(session_id)
         session_dir = self.base_dir / "sessions" / f"session_{session_id}"
         if session_dir.exists():
@@ -104,42 +82,40 @@ class MemoryManager:
             shutil.rmtree(session_dir)
 
     def list_sessions(self) -> List[str]:
-        """
-        列出系统中活动的会话列表
-        """
         return [
             f.stem for f in self._store._store_dir.iterdir()
             if f.suffix == ".json"
         ]
 
+    # ==========================================
+    # 接口二：高级 Markdown 长期记忆分层组装与注入
+    # ==========================================
+
     def load_markdown_memories_as_text(self, session_id: str) -> str:
-        """
-        仿 Claude Code：流式读取并层级合并【全局偏好 -> 项目显式规则 -> 动态自愈记忆】。
-        将其编译成一段极其规整的 Markdown 先验规则块，准备注入系统 Prompt。
-        """
         _, claude_md, memory_md = self._get_session_memory_paths(session_id)
         compiled_blocks = []
 
         if self.global_pref_file.exists():
             compiled_blocks.append(self.global_pref_file.read_text(encoding="utf-8"))
-
         if claude_md.exists():
             compiled_blocks.append(claude_md.read_text(encoding="utf-8"))
-
         if memory_md.exists():
             compiled_blocks.append(memory_md.read_text(encoding="utf-8"))
 
         return "\n***\n".join(compiled_blocks)
 
+    # ==========================================
+    # 接口三：自主记忆蒸馏管道 (Auto-Memory Distiller)
+    # ==========================================
+
     def distill_and_record_correction(self, session_id: str, failed_command: str, correction_context: str) -> None:
         """
-        【自主学习自愈核心】后台触发式经验提炼器。
-        将长任务中的错误教训或 Layer 3 人工驳回原因，蒸馏为一句话黄金准则，永久追加写入小本本。
+        【自主学习自愈核心】：将错误教训或 Layer 3 人工驳回原因，采用官方 OpenAI SDK 蒸馏并固化。
         """
         try:
             config = get_llm_config()
             if not config or not config.get("api_key"):
-                logger.warning("未配置大模型凭证，跳过本次长期记忆自主蒸馏。")
+                logger.warning("未配置大模型凭证，跳过长期记忆自主蒸馏。")
                 return
 
             prompt = f"""你是一个智能体高阶行为经验提炼器（Memory Distiller）。目前某个 AI Agent 在执行任务时触犯了安全、环境或业务逻辑边界，被人类用户/系统强制拦截驳回。
@@ -155,36 +131,37 @@ class MemoryManager:
 
 请直接输出这一行 Markdown 文本：
 """
-            # 通过同步的 httpx 客户端快速提取高阶脱水规则
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(
-                    f"{config['base_url']}/chat/completions",
-                    headers={"Authorization": f"Bearer {config['api_key']}"},
-                    json={
-                        "model": config["model_name"],
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.2
-                    }
-                )
-                if response.status_code == 200:
-                    res_json = response.json()
-                    distilled_rule = res_json["choices"][0]["message"]["content"].strip()
+            # 初始化官方 OpenAI 同步客户端，继承重试防线
+            client = OpenAI(
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                max_retries=3
+            )
 
-                    # 清洗潜在的多余格式标记
-                    if distilled_rule.startswith("```"):
-                        distilled_rule = distilled_rule.replace("```markdown", "").replace("```", "").strip()
-                    if not distilled_rule.startswith("-"):
-                        distilled_rule = f"- {distilled_rule}"
+            # 调用官方 API
+            response = client.chat.completions.create(
+                model=config["model_name"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2
+            )
 
-                    # 写入专属会话的长期记忆库文件
-                    _, _, memory_md = self._get_session_memory_paths(session_id)
-                    current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    final_line = f"{distilled_rule} (记录于 {current_date})\n"
+            distilled_rule = response.choices[0].message.content.strip()
 
-                    with open(memory_md, "a", encoding="utf-8") as f:
-                        f.write(final_line)
+            # 清洗包裹标记
+            if distilled_rule.startswith("```"):
+                distilled_rule = distilled_rule.replace("```markdown", "").replace("```", "").strip()
+            if not distilled_rule.startswith("-"):
+                distilled_rule = f"- {distilled_rule}"
 
-                    logger.info(f"[Session-{session_id}] 成功自主沉淀一条长期纠错记忆: {distilled_rule}")
+            # 永久写入共享的长效记忆区
+            _, _, memory_md = self._get_session_memory_paths(session_id)
+            current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+            final_line = f"{distilled_rule} (记录于 {current_date})\n"
+
+            with open(memory_md, "a", encoding="utf-8") as f:
+                f.write(final_line)
+
+            logger.info(f"[Session-{session_id}] 成功沉淀一条长效 Markdown 记忆: {distilled_rule}")
+
         except Exception as e:
-            # 记忆蒸馏属于非阻塞辅助系统，任何捕获的异常绝不拖垮主执行流程
             logger.error(f"长期记忆自主蒸馏管道发生异常: {str(e)}")
