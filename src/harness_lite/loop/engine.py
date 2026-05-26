@@ -16,8 +16,8 @@ from harness_lite.security.manager import security_manager
 from harness_lite.config.loader import get_llm_config
 from harness_lite.loop.strategy import ReActStrategy
 
-
-
+# 【核心添加点】引入物理执行层的会话上下文变量，打通全链路 Session 追踪
+from harness_lite.tools.execution_ops import current_session_id
 
 SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂的系统任务。
 
@@ -41,8 +41,10 @@ SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂�
 4. 完成工具调用后，根据结果回复用户。
 """
 
+
 class AsyncLoopEngine:
     """Core Async LLM Engine."""
+
     def __init__(self, strategy=None):
         """
         Initialize the async engine.
@@ -54,15 +56,18 @@ class AsyncLoopEngine:
         self.security = security_manager
         self.registry = tool_registry
 
-    async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None, status_callback: Callable[[str], None] = None) -> str:
+    async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None,
+                  status_callback: Callable[[str], None] = None) -> str:
         """
         委托给具体的 Strategy 来执行任务。
         """
+        # 【核心添加点】协程入口层：强制绑定当前异步上下文的 session_id 状态
+        current_session_id.set(session_id)
         return await self.strategy.execute(task, self, session_id, stream_callback, status_callback)
 
-    def build_initial_messages(self, task: str) -> List[Dict[str, str]]:
+    def build_initial_messages(self, task: str, session_id: str = "default") -> List[Dict[str, str]]:
         """
-        构建初始系统消息
+        构建初始系统消息（已升级：支持 Session 级别物理沙箱路径的自适应渲染）
         """
         tools_schema = self._get_all_tools_schema()
         all_skills = skill_registry.list_all()
@@ -75,18 +80,25 @@ class AsyncLoopEngine:
             skills_list_str = "\n".join(lines)
         else:
             skills_list_str = "当前未加载任何特定的业务技能指南。"
-        sandbox_absolute_path = str(self.security.workspace_root)
+
+        prior_memories_md = self.memory.load_markdown_memories_as_text(session_id)
+
+        # 【核心修改点】联动安全管理器，实时获取该租户独占的物理子文件夹，作为注入提示词的绝对路径边界
+        sandbox_absolute_path = str(self.security.get_session_workspace(session_id))
+
         system_content = SYSTEM_PROMPT.format(
             workspace_root=sandbox_absolute_path,
             tools_schema=json.dumps(tools_schema, ensure_ascii=False),
             skills_list=skills_list_str
         )
+        full_system_prompt = f"{system_content}\n\n【你先前通过学习或被人类纠错沉淀下来的核心长效行为备忘录】\n{prior_memories_md}"
         return [
-            {"role": "system", "content": system_content},
+            {"role": "system", "content": full_system_prompt},
             {"role": "user", "content": task}
         ]
 
-    async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None, status_callback=None) -> Dict[str, Any]:
+    async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None,
+                             status_callback=None) -> Dict[str, Any]:
         """
         异步调用 LLM API 带有指数退避的重试机制 (Exponential Backoff Retry)
         """
@@ -98,7 +110,8 @@ class AsyncLoopEngine:
             try:
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     if stream:
-                        return await self._call_llm_stream_async(client, config, messages, tools, stream_callback, status_callback)
+                        return await self._call_llm_stream_async(client, config, messages, tools, stream_callback,
+                                                                 status_callback)
                     else:
                         payload = {
                             "model": config["model_name"],
@@ -122,10 +135,12 @@ class AsyncLoopEngine:
                     return {"choices": [{"message": {"content": error_msg}}]}
                 wait_time = base_wait * (2 ** attempt)
                 if stream_callback:
-                    status_callback(f"[🔁 网络抖动] API 调用异常 ({str(e)})，将在 {wait_time} 秒后进行第 {attempt + 1} 次重试...")
+                    status_callback(
+                        f"[🔁 网络抖动] API 调用异常 ({str(e)})，将在 {wait_time} 秒后进行第 {attempt + 1} 次重试...")
                 await asyncio.sleep(wait_time)
 
-    async def _call_llm_stream_async(self, client, config, messages, tools, stream_callback, status_callback) -> Dict[str, Any]:
+    async def _call_llm_stream_async(self, client, config, messages, tools, stream_callback, status_callback) -> Dict[
+        str, Any]:
         """
         异步流式请求处理 (增加抛出异常以便外层进行重试)
         """
@@ -235,22 +250,22 @@ class AsyncLoopEngine:
             }]
         }
 
-    async def _safe_execute_tool_wrapper(self, call_id: str, tool_name: str, arguments: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+    async def _safe_execute_tool_wrapper(self, call_id: str, tool_name: str, arguments: Dict[str, Any],
+                                         session_id: str) -> Dict[str, Any]:
         """
         异步工具执行的包装器。
-        使用 asyncio.to_thread 防止同步的工具代码阻塞主事件循环，
-        并确保任何未知的极端异常都能被打包成返回结果，绝不导致框架崩溃。
+        使用 asyncio.to_thread 防止同步的工具代码阻塞主事件循环
         """
         try:
             output = await asyncio.to_thread(self._execute_tool, tool_name, arguments, session_id)
             return {"tool_call_id": call_id, "output": output}
         except Exception as e:
-            return {"tool_call_id": call_id, "output": "", "error": f"[System Critical Error] 异步调度框架异常: {str(e)}"}
+            return {"tool_call_id": call_id, "output": "",
+                    "error": f"[System Critical Error] 异步调度框架异常: {str(e)}"}
 
     async def process_tool_calls_async(self, tool_calls: List[Dict[str, Any]], session_id: str) -> List[Dict[str, Any]]:
         """
-        异步处理工具调用：已修复并发竞态条件 (Race Condition) 漏洞
-        采用严格顺序执行与 Fail-Fast (快速失败) 策略。
+        异步处理工具调用：采用严格顺序执行与 Fail-Fast (快速失败) 策略。
         """
         results = []
         valid_tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
@@ -264,25 +279,29 @@ class AsyncLoopEngine:
                 try:
                     arguments = json.loads(arguments)
                 except json.JSONDecodeError as e:
-                    error_msg = f"JSON解析失败: 无法解析参数 '{arguments}'。原因: {str(e)}。请检查是否缺失括号、引号转义是否正确，并重新输出合法的 JSON 参数。"
+                    error_msg = f"JSON解析失败: 无法解析参数 '{arguments}'。原因: {str(e)}。请检查并重新输出合法的 JSON 参数。"
                     results.append({"tool_call_id": call_id, "output": "", "error": error_msg})
                     continue
 
             res = await self._safe_execute_tool_wrapper(call_id, tool_name, arguments, session_id)
             results.append(res)
-            if res.get("error") or str(res.get("output", "")).startswith(("[Security", "[Error", "Failed")):
+            if res.get("error") or str(res.get("output", "")).startswith(
+                    ("[Security", "[Error", "Failed", "静态防御", "语义审计")):
                 results.append({
                     "tool_call_id": "system_interrupt",
                     "output": "",
-                    "error": f"[System] 检测到前置工具 '{tool_name}' 执行失败，出于安全与逻辑依赖考虑，系统已自动取消同批次尚未执行的后续工具调用。请先修复上述错误。"
+                    "error": f"[System] 检测到前置工具 '{tool_name}' 未能安全通过防御审计，出于逻辑依赖与系统安全考虑，同批次后续指令已被取消。"
                 })
                 break
         return results
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any], session_id: str) -> str:
         """
-        执行单一工具,增强异常反馈
+        执行单一工具，增强异常反馈并实施进程池会话双重绑定机制
         """
+        # 【核心添加点】双重保险：在物理线程池的工作线程上下文中，强制注入当前的 session_id
+        current_session_id.set(session_id)
+
         allowed, error_msg = self.security.intercept(tool_name, tool_args, session_id)
         if not allowed:
             return f"[Security Blocked] 安全拦截: {error_msg}。请更换策略。"
@@ -291,7 +310,6 @@ class AsyncLoopEngine:
             return f"[Tool Not Found] 工具 '{tool_name}' 不存在，请检查并使用系统提供的工具名称。"
 
         try:
-            # 兼容现有的同步 Tool execute，后续可扩展 await tool.execute_async()
             result = tool.execute(**tool_args)
             return str(result)
         except Exception as e:

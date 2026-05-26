@@ -1,68 +1,77 @@
 """
 Strategy module for agent execution flow.
+Upgraded with dynamic token-based context compression and multi-tenant safety.
 """
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Optional, List, Dict
+import json
+
+# 【核心添加点】引入全新的一阶段动态上下文管理器
+from harness_lite.context.manager import DynamicContextManager
+
 
 class BaseStrategy(ABC):
     """编排策略基类"""
 
     @abstractmethod
-    async def execute(self, task: str, engine: Any, session_id: str, stream_callback: Optional[Callable[[str], None]] = None) -> str:
+    async def execute(self, task: str, engine: Any, session_id: str,
+                      stream_callback: Optional[Callable[[str], None]] = None) -> str:
         """
         执行策略的抽象方法
         """
         pass
 
+
 class ReActStrategy(BaseStrategy):
-    """健壮的 ReAct 循环策略，自带上下文保护与熔断机制"""
+    """高级 ReAct 循环策略，自带 Token 级自适应‘记忆收缩’上下文管理与多层安全反哺机制"""
 
-    def __init__(self, max_steps: int = 15, max_context_length: int = 12):
+    def __init__(self, max_steps: int = 15, max_tokens_threshold: int = 64000):
+        """
+        初始化策略。
+
+        Args:
+            max_steps: 最大允许的思考循环步数限制
+            max_tokens_threshold: 触发上下文记忆收缩的 Token 高水位线
+        """
         self.max_steps = max_steps
-        self.max_context_length = max_context_length
+        # 初始化上下文管理器插槽
+        self.context_manager = DynamicContextManager(max_allowed_tokens=max_tokens_threshold)
 
-    def _prune_context(self, messages: List[Dict[str, Any]], status_callback: Optional[Callable[[str], None]]) -> List[Dict[str, Any]]:
-        """
-        安全地修剪上下文：滑动窗口机制
-        必须保证 OpenAI 格式的严格性：'tool' 角色消息不能失去对应的 'assistant' (tool_calls) 消息。
-        """
-        if len(messages) <= self.max_context_length:
-            return messages
-
-        core_context = messages[:2]
-        recent_context = []
-
-        idx = len(messages) - 1
-        while idx >= 2 and len(recent_context) < (self.max_context_length - 2):
-            recent_context.insert(0, messages[idx])
-            idx -= 1
-        while recent_context and recent_context[0].get("role") == "tool":
-            recent_context.pop(0)
-        if status_callback and len(messages) != len(core_context + recent_context):
-            status_callback("[🧹 内存优化] 历史会话过长，已自动折叠早期的工具执行日志，释放上下文空间。")
-
-        return core_context + recent_context
-
-    async def execute(self, task: str, engine: Any, session_id: str, stream_callback: Optional[Callable[[str], None]] = None, status_callback: Optional[Callable[[str], None]] = None) -> str:
-        # 1. 组装初始化上下文
+    async def execute(self, task: str, engine: Any, session_id: str,
+                      stream_callback: Optional[Callable[[str], None]] = None,
+                      status_callback: Optional[Callable[[str], None]] = None) -> str:
+        # 1. 组装并初始化多租户上下文，将当前的 session_id 稳妥向下透传
         messages = engine.memory.load_context(session_id)
         if not messages:
-            messages = engine.build_initial_messages(task)
+            messages = engine.build_initial_messages(task, session_id=session_id)
         else:
             messages.append({"role": "user", "content": task})
 
         step = 0
         full_response = ""
-        consecutive_errors = 0 # 连续错误计数器
+        consecutive_errors = 0  # 连续错误计数器
 
         while step < self.max_steps:
             step += 1
 
-            messages = self._prune_context(messages, status_callback)
+            # ========================================================
+            # 【🔥 阶段一落地核心】：废除原数行截断，调用 Token 级自适应记忆收缩引擎
+            # ========================================================
+            from harness_lite.tools.execution_ops import process_manager
+            active_shell = process_manager.get_shell(session_id)
+            current_terminal_cwd = active_shell.last_known_cwd
+            messages = await self.context_manager.compress_if_overflow(
+                messages=messages,
+                engine=engine,
+                current_cwd=current_terminal_cwd,
+                status_callback=status_callback
+            )
+
             # 步骤A：推理（调用LLM）
             is_streaming = stream_callback is not None
-            response = await engine.call_llm_async(messages, is_streaming, stream_callback=stream_callback, status_callback=status_callback)
+            response = await engine.call_llm_async(messages, is_streaming, stream_callback=stream_callback,
+                                                   status_callback=status_callback)
 
             # 步骤B：解析意图
             assistant_message = response.get("choices", [{}])[0].get("message", {})
@@ -76,6 +85,7 @@ class ReActStrategy(BaseStrategy):
                     tool_names = [tc["function"]["name"] for tc in valid_tool_calls]
                     names_str = ", ".join(tool_names)
                     status_callback(f"[⚙️ 执行中] 正在并发调度工具: {names_str} ...")
+
                 # 记录模型的思考与工具调用请求
                 messages.append({
                     "role": "assistant",
@@ -83,7 +93,7 @@ class ReActStrategy(BaseStrategy):
                     "tool_calls": tool_calls,
                 })
 
-                # 异步执行工具
+                # 异步执行工具并透传会话租户状态
                 tool_results = await engine.process_tool_calls_async(tool_calls, session_id)
 
                 has_error_in_this_step = False
@@ -95,28 +105,34 @@ class ReActStrategy(BaseStrategy):
                     if error_val:
                         content = error_val
                         has_error_in_this_step = True
-                    elif str(output_val).startswith("[Security") or str(output_val).startswith("[Tool Not") or str(output_val).startswith("[Execution Error]"):
+                    # 安全反哺：如果触发了静态防御拦截、语义大模型阻断，或人工 HITL 拒绝，将其视为行为熔断标志
+                    elif str(output_val).startswith(
+                            ("[Security", "[Tool Not", "[Execution Error]", "静态防御", "语义审计")):
                         content = output_val
                         has_error_in_this_step = True
                     else:
                         content = str(output_val)
-                    MAX_TOOL_OUTPUT_LEN = 4000
-                    if len(content) > MAX_TOOL_OUTPUT_LEN:
-                        content = content[:MAX_TOOL_OUTPUT_LEN] + f"\n\n...[内容过长: 剩余 {len(content) - MAX_TOOL_OUTPUT_LEN} 字符已被系统强制截断以保护上下文]..."
+
+                    # 动态上下文管理器会对单次大输出进行安全兜底截断
+                    MAX_SINGLE_OUTPUT_LIMIT = 3500
+                    if len(content) > MAX_SINGLE_OUTPUT_LIMIT:
+                        content = content[
+                                  :MAX_SINGLE_OUTPUT_LIMIT] + f"\n\n...[内容过长: 剩余 {len(content) - MAX_SINGLE_OUTPUT_LIMIT} 字符已被系统强制截断以保护上下文]..."
 
                     messages.append({
                         "role": "tool",
                         "tool_call_id": result.get("tool_call_id"),
                         "content": content
                     })
+
                 if has_error_in_this_step:
                     consecutive_errors += 1
                     if status_callback:
                         status_callback(
-                            f"[⚠️ 纠错中] 工具执行异常 (连续 {consecutive_errors} 次)，模型正在自我修正..."
+                            f"[⚠️ 纠错中] 链路执行异常反馈 (连续 {consecutive_errors} 次)，引导大模型自我修正中..."
                         )
                     if consecutive_errors >= 3:
-                        break_msg = "\n[系统熔断] 工具连续调用失败过多，已强制终止本次推理。"
+                        break_msg = "\n[系统熔断] 工具流连续调用失败过多或触犯安全红线，已强制终止本次推理循环。"
                         if stream_callback:
                             stream_callback(break_msg)
                         messages.append({"role": "assistant", "content": break_msg})
@@ -125,8 +141,9 @@ class ReActStrategy(BaseStrategy):
                 else:
                     consecutive_errors = 0
                     if valid_tool_calls and status_callback:
-                        status_callback(f"[✅ 已完成] 工具数据获取成功，交由大模型总结...")
-                # 继续下一轮循环，让LLM根据工具结果作答
+                        status_callback(f"[✅ 已完成] 阶段工具数据获取成功，交由主模型总结...")
+
+                # 继续下一轮循环，让LLM根据脱水或原始的工具结果作答
                 continue
 
             # 步骤 D：判断终态 (如果没有 Tool Calls，说明是纯文本回复)
@@ -149,4 +166,3 @@ class ReActStrategy(BaseStrategy):
             messages.append({"role": "assistant", "content": final_response})
         engine.memory.save_context(session_id, messages)
         return full_response
-
