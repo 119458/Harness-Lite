@@ -200,12 +200,19 @@ class SecurityManager:
                 max_retries=3
             )
 
+            extra_body = {
+                "thinking": {"type": "disabled"},
+                "enable_thinking": False,
+                "chat_template_kwargs": {"thinking": False}
+            }
+
             # 调用官方 Completion 接口
             response = client.chat.completions.create(
                 model=config["model_name"],
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                response_format={"type": "json_object"}  # 强制要求模型输出严格的 JSON
+                response_format={"type": "json_object"},  # 强制要求模型输出严格的 JSON
+                extra_body = extra_body
             )
 
             content = response.choices[0].message.content.strip()

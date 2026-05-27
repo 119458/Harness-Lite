@@ -9,6 +9,9 @@ import json
 
 # 【核心添加点】引入全新的一阶段动态上下文管理器
 from harness_lite.context.manager import DynamicContextManager
+from harness_lite.config.loader import get_llm_config
+
+config = get_llm_config()
 
 
 class BaseStrategy(ABC):
@@ -87,11 +90,14 @@ class ReActStrategy(BaseStrategy):
                     status_callback(f"[⚙️ 执行中] 正在并发调度工具: {names_str} ...")
 
                 # 记录模型的思考与工具调用请求
-                messages.append({
+                assistant_payload = {
                     "role": "assistant",
                     "content": assistant_content,
                     "tool_calls": tool_calls,
-                })
+                }
+                if config.get("thinking_mode") and assistant_message.get("reasoning_content"):
+                    assistant_payload["reasoning_content"] = assistant_message["reasoning_content"]
+                messages.append(assistant_payload)
 
                 # 异步执行工具并透传会话租户状态
                 tool_results = await engine.process_tool_calls_async(tool_calls, session_id)
@@ -114,7 +120,7 @@ class ReActStrategy(BaseStrategy):
                         content = str(output_val)
 
                     # 动态上下文管理器会对单次大输出进行安全兜底截断
-                    MAX_SINGLE_OUTPUT_LIMIT = 3500
+                    MAX_SINGLE_OUTPUT_LIMIT = 40000
                     if len(content) > MAX_SINGLE_OUTPUT_LIMIT:
                         content = content[
                                   :MAX_SINGLE_OUTPUT_LIMIT] + f"\n\n...[内容过长: 剩余 {len(content) - MAX_SINGLE_OUTPUT_LIMIT} 字符已被系统强制截断以保护上下文]..."
@@ -148,7 +154,10 @@ class ReActStrategy(BaseStrategy):
 
             # 步骤 D：判断终态 (如果没有 Tool Calls，说明是纯文本回复)
             if assistant_content:
-                messages.append({"role": "assistant", "content": assistant_content})
+                assistant_payload = {"role": "assistant", "content": assistant_content}
+                if config.get("thinking_mode") and assistant_message.get("reasoning_content"):
+                    assistant_payload["reasoning_content"] = assistant_message["reasoning_content"]
+                messages.append(assistant_payload)
                 full_response += assistant_content
             elif not tool_calls:
                 error_msg = "\n[系统兜底] 模型返回了空内容，请检查大模型服务是否正常。"

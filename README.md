@@ -36,6 +36,10 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
   生成一个贪吃蛇程序并运行，其会在规定的沙箱环境中生成一份py代码并在创建的子进程上调用程序
   可以成功调用crate，edit，bash等工具。
 
+## 🚀 [2026-05-27] cli优化和添加模型思考开关
+- 将之前通过input的用户输出改为prompt_toolkit库来处理，异步处理用户输入，使得终端的用户输入连续不卡顿
+- 在.env中添加LLM_THINKING_MODE=false/true的关键字，可以开启大模型思考获取关闭大模型思考
+
 ## 架构
 
 ```

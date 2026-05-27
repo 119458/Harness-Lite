@@ -1,4 +1,5 @@
-"""Configuration loader module.
+"""
+Configuration loader module.
 
 Loads LLM configuration from .env file using python-dotenv.
 """
@@ -7,7 +8,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-_CONFIG: Dict[str, str] | None = None
+_CONFIG: Dict[str, any] | None = None
 _ENV_PATH: Path | None = None
 
 
@@ -38,6 +39,9 @@ def _load_env() -> None:
     base_url = os.getenv("LLM_BASE_URL")
     model_name = os.getenv("LLM_MODEL_NAME")
 
+    thinking_mode_str = os.getenv("LLM_THINKING_MODE", "false").lower()
+    thinking_mode = thinking_mode_str == "true"
+
     # Validate required config
     missing = []
     if not api_key:
@@ -57,6 +61,7 @@ def _load_env() -> None:
         "api_key": api_key,
         "base_url": base_url,
         "model_name": model_name,
+        "thinking_mode": thinking_mode,
     }
 
 

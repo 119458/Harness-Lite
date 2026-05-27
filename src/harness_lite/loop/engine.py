@@ -126,8 +126,15 @@ class AsyncLoopEngine:
         config = get_llm_config()
         tools = self._get_all_tools_schema() or None
 
+        processed_messages = []
+        for msg in messages:
+            clean_msg = {k: v for k, v in msg.items()}
+            if not config.get("thinking_mode") and "reasoning_content" in clean_msg:
+                del clean_msg["reasoning_content"]
+            processed_messages.append(clean_msg)
+
         # 数据在灌入 SDK 前，清洗掉残余的非标准 Surrogate 乱码
-        safe_messages = sanitize_surrogates(messages)
+        safe_messages = sanitize_surrogates(processed_messages)
 
         client = AsyncOpenAI(
             api_key=config["api_key"],
@@ -140,9 +147,16 @@ class AsyncLoopEngine:
                 return await self._call_llm_stream_async(client, config, safe_messages, tools, stream_callback,
                                                          status_callback)
             else:
+                is_thinking = config.get("thinking_mode", False)
+                extra_body = {
+                    "thinking": {"type": "enabled" if is_thinking else "disabled"},  # DeepSeek 官方原生标准协议
+                    "enable_thinking": is_thinking,  # 阿里云 DashScope / Qwen 混合思考系列标准
+                    "chat_template_kwargs": {"thinking": is_thinking}
+                }
                 kwargs = {
                     "model": config["model_name"],
                     "messages": safe_messages,
+                    "extra_body": extra_body
                 }
                 if tools:
                     kwargs["tools"] = tools
@@ -162,13 +176,22 @@ class AsyncLoopEngine:
         利用 OpenAI SDK 实现结构化流式消息处理，带有点对点强制判空安全网
         """
         full_content = ""
+        full_reasoning_content = ""
         tool_calls_dict = {}
         notified_tool_call = False
+
+        is_thinking = config.get("thinking_mode", False)
+        extra_body = {
+            "thinking": {"type": "enabled" if is_thinking else "disabled"},  # DeepSeek 官方原生标准协议
+            "enable_thinking": is_thinking,  # 阿里云 DashScope / Qwen 混合思考系列标准
+            "chat_template_kwargs": {"thinking": is_thinking}  # vLLM 开源部署自适应模板指令标准
+        }
 
         kwargs = {
             "model": config["model_name"],
             "messages": messages,
-            "stream": True
+            "stream": True,
+            "extra_body": extra_body
         }
         if tools:
             kwargs["tools"] = tools
@@ -187,6 +210,15 @@ class AsyncLoopEngine:
                 # ========================================================
                 if delta is None:
                     continue
+
+                if config.get("thinking_mode"):
+                    reasoning_chunk = getattr(delta, "reasoning_content", None)
+                    if reasoning_chunk:
+                        full_reasoning_content += reasoning_chunk
+                        if status_callback:
+                            clean_reasoning = reasoning_chunk.replace("\n", " ").strip()
+                            if clean_reasoning:
+                                status_callback(f"[🧠 思考中] {clean_reasoning}")
 
                 # 1. 安全流式抽取纯文本
                 if hasattr(delta, 'content') and delta.content:
@@ -218,14 +250,14 @@ class AsyncLoopEngine:
 
             final_tool_calls = list(tool_calls_dict.values()) if tool_calls_dict else None
 
-            return {
-                "choices": [{
-                    "message": {
-                        "content": full_content,
-                        "tool_calls": final_tool_calls
-                    }
-                }]
+            res_message = {
+                "content": full_content,
+                "tool_calls": final_tool_calls
             }
+            if config.get("thinking_mode") and full_reasoning_content:
+                res_message["reasoning_content"] = full_reasoning_content
+
+            return {"choices": [{"message": res_message}]}
 
         except Exception as e:
             error_msg = f"\n[API 流式错误] SDK 传输流遭遇未知中断. 详情: {str(e)}\n"

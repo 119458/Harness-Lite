@@ -5,6 +5,7 @@ import json
 import logging
 from typing import List, Dict, Any, Tuple
 import httpx
+from openai import AsyncOpenAI
 
 try:
     import tiktoken
@@ -19,7 +20,7 @@ class DynamicContextManager:
     """
     动态上下文管理器：负责自适应 Token 计算、插槽监控与历史自动化‘记忆收缩’合并
     """
-    def __init__(self, max_allowed_tokens: int = 7000, model_name: str = "gpt-40-mini"):
+    def __init__(self, max_allowed_tokens: int = 64000, model_name: str = "gpt-40-mini"):
         """
         初始化动态上下文管理器。
 
@@ -60,6 +61,9 @@ class DynamicContextManager:
             total_tokens += self.calculate_string_tokens(msg.get("content", ""))
             total_tokens += self.calculate_string_tokens(msg.get("role", ""))
             total_tokens += self.calculate_string_tokens(msg.get("name", ""))
+
+            if "reasoning_content" in msg and msg["reasoning_content"]:
+                total_tokens += self.calculate_string_tokens(msg["reasoning_content"])
 
             tool_calls = msg.get("tool_calls")
             if tool_calls:
@@ -118,34 +122,43 @@ class DynamicContextManager:
             config = get_llm_config()
             raw_history_text = ""
             for m in compressible_chunk:
+                if m.get("reasoning_content"):
+                    raw_history_text += f"[模型内心思考]: {m['reasoning_content']}\n"
                 raw_history_text += f"[{m['role'].upper()}]: {m.get('content', '')}\n"
                 if m.get("tool_calls"):
                     raw_history_text += f"(请求调用工具: {json.dumps(m['tool_calls'], ensure_ascii=False)})\n"
 
             prompt = f"""你是一个智能体执行历史链条收缩器（Context Condenser）。目前某个 AI Agent 经历了一系列漫长繁重的工具调度步骤，由于日志量极大，我们需要将这些旧步骤【脱水压缩】。
-请将下面这段被摘出的原始工具交互日志，高度提炼总结为【一至两句话】的历史事实纪要，来说明 Agent 在这个阶段进行了什么尝试、动用了什么工具、最终取得了什么业务进展。
+            请将下面这段被摘出的原始工具交互日志，高度提炼总结为【一至两句话】的历史事实纪要，来说明 Agent 在这个阶段进行了什么尝试、动用了什么工具、最终取得了什么业务进展。
 
-【待压缩的原始交互日志】
-{raw_history_text}
+            【待压缩的原始交互日志】
+            {raw_history_text}
 
-【硬性提炼规则】
-1. 语言必须高度凝练精辟，形如：“在早期步骤中，Agent 通过 read_file 查阅了代码逻辑，并调用 bash_terminal 成功安装了第三方依赖，为后续修复做好了准备。”
-2. 绝对不含任何前缀、闲聊，直接输出总结完的 Markdown 文本。
-"""
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.post(
-                    f"{config['base_url']}/chat/completions",
-                    headers={"Authorization": f"Bearer {config['api_key']}"},
-                    json={
-                        "model": config["model_name"],
-                        "messages": [{"role": "user", "content": prompt}],
-                        "temperature": 0.1
-                    }
-                )
-                if response.status_code == 200:
-                    summary = response.json()["choices"][0]["message"]["content"].strip()
-                else:
-                    summary = "Agent 在早期阶段执行了一系列工具链路调试及文件检索操作。"
+            【硬性提炼规则】
+            1. 语言必须高度凝练精辟，形如：“在早期步骤中，Agent 通过 read_file 查阅了代码逻辑，并调用 bash_terminal 成功安装了第三方依赖，为后续修复做好了准备。”
+            2. 绝对不含任何前缀、闲聊，直接输出总结完的 Markdown 文本。
+            """
+            client = AsyncOpenAI(
+                api_key=config["api_key"],
+                base_url=config["base_url"],
+                max_retries=2
+            )
+            extra_body = {
+                "thinking": {"type": "disabled"},
+                "enable_thinking": False,
+                "chat_template_kwargs": {"thinking": False}
+            }
+            response = await client.chat.completions.create(
+                model=config["model_name"],
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                extra_body=extra_body,
+                timeout=15.0
+            )
+            if response.choices and response.choices[0].message.content:
+                summary = response.choices[0].message.content.strip()
+            else:
+                summary = "Agent 在早期阶段执行了一系列工具链路调试及文件检索操作。"
         except Exception as e:
             summary = "Agent 在早期阶段顺利完成了部分前置文件的查阅与系统状态初始化。"
             logger.error(f"历史会话自动收缩时触发 LLM 摘要调用异常: {str(e)}")
@@ -163,7 +176,7 @@ class DynamicContextManager:
         }
         optimized_messages = anchor_slots + [checkpoint_message] + remaining_history
         if status_callback:
-            saved_tokens = current_total - self.calculate_string_tokens(str(optimized_messages))
+            saved_tokens = current_total - self.calculate_messages_tokens(optimized_messages)
             status_callback(f"[✅ 优化完毕] 历史成功收缩！已安全为你释放出 {saved_tokens} 个宝贵的 Token 空间。")
 
         return optimized_messages
