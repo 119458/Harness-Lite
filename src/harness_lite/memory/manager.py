@@ -75,11 +75,26 @@ class MemoryManager:
             self._store.save(session_id, trimmed)
 
     def clear_context(self, session_id: str) -> None:
+        """
+        内核级热重置（Hot-Reset）：保留第 0 位的 system 核心人设与工具防线消息，
+        清空其余所有的 user、assistant 和 tool 对话历史，并原地覆写原 JSON 文件。
+        如果没有任何历史消息或未生成文件，则执行安全的物理清理降级。
+        """
+        try:
+            messages = self.load_context(session_id)
+            if messages and messages[0].get("role") == "system":
+                self.save_context(session_id, [messages[0]])
+                logger.info(f"[Session-{session_id}] 成功执行内核级热重置，安全保留 System 设定。")
+                return
+        except Exception as e:
+            logger.warning(f"[Session-{session_id}] 解析上下文尝试热重置时发生异常: {str(e)}")
+
         self._store.delete(session_id)
         session_dir = self.base_dir / "sessions" / f"session_{session_id}"
         if session_dir.exists():
             import shutil
             shutil.rmtree(session_dir)
+        logger.info(f"[Session-{session_id}] 上下文为空或不合法，已完成基础物理清空。")
 
     def list_sessions(self) -> List[str]:
         return [

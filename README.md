@@ -40,6 +40,14 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 将之前通过input的用户输出改为prompt_toolkit库来处理，异步处理用户输入，使得终端的用户输入连续不卡顿
 - 在.env中添加LLM_THINKING_MODE=false/true的关键字，可以开启大模型思考获取关闭大模型思考
 
+## 🚀 [2026-05-29] cli添加/命令
+- /model: 查看当前大语言模型名称及内核运行模式,
+- /tool: 列出当前沙箱内核中注册的所有原子工具 (Tools),
+- /skill: 列出当前系统已加载的全部纯文本 SOP 技能书,
+- /clear: 彻底清空当前会话的短期上下文记忆与沙箱缓存,
+- /session: 查看当前活跃会话的 Session ID 与存储详情,
+- /exit: 优雅安全地退出整个 Harness-Lite 智能体终端,
+
 ## 架构
 
 ```
