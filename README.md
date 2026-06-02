@@ -48,6 +48,12 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - /session: 查看当前活跃会话的 Session ID 与存储详情,
 - /exit: 优雅安全地退出整个 Harness-Lite 智能体终端,
 
+## 🚀 [2026-06-2] cli的/mem0，长期记忆采用mem0开源框架进行
+- 每一次用户对话结束时使用mem0框架对回答内容进行处理和向量化，在每次user询问时现使用其在数据库中选择其中最相关的5条数据加载到system prompt中。
+- 默认是关闭状态，开启需要使用/命令，/mem0开启
+- 需要指定embedding模型的api
+- 采用chroma数据库其只能执行语义检索，如果需要关键词检索需要更换数据库
+
 ## 架构
 
 ```

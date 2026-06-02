@@ -1,17 +1,20 @@
 """Memory manager module.
 
-Provides unified interface for managing both short-term JSON chat histories
-and Claude Code-style long-term Markdown auto-memories.
+Provides unified interface for managing both short-term JSON chat histories,
+legacy Markdown auto-memories, and advanced Mem0 vector graph memories.
 """
 import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
+import threading
 
-# 【核心替换点】引入官方 OpenAI 同步客户端，斩断 httpx 依赖
+# 引入官方 OpenAI 同步客户端 (用于传统模式的自动蒸馏)
 from openai import OpenAI
+# 引入 Mem0 核心记忆器
+from mem0 import Memory
 
 from .store import MemoryStore
 from harness_lite.config.loader import get_llm_config
@@ -20,7 +23,7 @@ logger = logging.getLogger("harness_lite.memory")
 
 
 class MemoryManager:
-    """分层记忆管理器：统管短期 JSON 聊天流与长期自愈型 Markdown 备忘录"""
+    """分层记忆管理器：统管短期 JSON 聊天流与双轨制长期记忆 (Markdown / Mem0)"""
 
     def __init__(self, store_dir: str = "./memory_store"):
         self.base_dir = Path(store_dir).resolve()
@@ -29,6 +32,10 @@ class MemoryManager:
 
         self.global_pref_file = self.base_dir / "global_preferences.md"
         self._init_global_preferences()
+
+        # 【新增状态】：默认关闭 Mem0，延迟初始化
+        self.use_mem0 = False
+        self.mem0 = None
 
     def _init_global_preferences(self) -> None:
         if not self.global_pref_file.exists():
@@ -40,10 +47,7 @@ class MemoryManager:
             self.global_pref_file.write_text(content, encoding="utf-8")
 
     def _get_session_memory_paths(self, session_id: str) -> Tuple[Path, Path, Path]:
-        """
-        获取长期记忆文件的存放路径。
-        解耦动态会话，开辟长效项目级永久累积区，支持跨会话历史共享一套进化备忘录。
-        """
+        """【原版保留】获取传统长期记忆文件的存放路径"""
         persistent_dir = self.base_dir / "persistent_memory"
         auto_mem_dir = persistent_dir / "auto_memory"
         auto_mem_dir.mkdir(parents=True, exist_ok=True)
@@ -52,18 +56,99 @@ class MemoryManager:
         memory_md = auto_mem_dir / "MEMORY.md"
 
         if not claude_md.exists():
-            claude_md.write_text("# 项目开发显式规范手册\n- 技术栈规范: 优先采用标准库与异步架构模式。\n", encoding="utf-8")
+            claude_md.write_text("# 项目开发显式规范手册\n- 技术栈规范: 优先采用标准库与异步架构模式。\n",
+                                 encoding="utf-8")
         if not memory_md.exists():
-            memory_md.write_text("# 智能体自主学习与动态纠错经验记忆库 (Auto-Memory)\n> 本文件记录用户人工驳回的教训与自愈准则。\n\n## 经过验证的行为准则与惩罚记忆：\n", encoding="utf-8")
+            memory_md.write_text(
+                "# 智能体自主学习与动态纠错经验记忆库 (Auto-Memory)\n> 本文件记录用户人工驳回的教训与自愈准则。\n\n## 经过验证的行为准则与惩罚记忆：\n",
+                encoding="utf-8")
 
         return persistent_dir, claude_md, memory_md
 
+    def _init_mem0(self) -> Memory:
+        """初始化 Mem0 引擎"""
+        config = get_llm_config()
+        current_model = config.get("model_name", "gpt-3.5-turbo")
+
+        # 模型降级路由
+        mem0_model = current_model
+        model_lower = current_model.lower()
+        if "reasoner" in model_lower or "r1" in model_lower or "thinking" in model_lower:
+            mem0_model = current_model.replace("reasoner", "chat").replace("-r1", "")
+            if mem0_model == current_model:
+                mem0_model = "deepseek-chat"
+            logger.info(f"[Mem0 Init] 检测到思考模型，后台记忆蒸馏已降级路由至: {mem0_model}")
+
+        mem0_config = {
+            "vector_store": {
+                "provider": "chroma",
+                "config": {
+                    "collection_name": "harness_auto_memory",
+                    "path": str(self.base_dir / "mem0_db")
+                }
+            },
+            "llm": {
+                "provider": "openai",
+                "config": {
+                    "model": mem0_model,
+                    "api_key": config.get("api_key"),
+                    "base_url": config.get("base_url"),
+                    "temperature": 0.0,
+                    "max_tokens": 1000,
+                    "model_kwargs": {
+                        "extra_body": {
+                            "thinking": {"type": "disabled"},
+                            "enable_thinking": False,
+                            "chat_template_kwargs": {"thinking": False}
+                        }
+                    }
+                }
+            },
+            "embedder": {
+                "provider": "openai",
+                "config": {
+                    "model": "text-embedding-3-small",
+                    "api_key": config.get("api_key"),
+                    "base_url": config.get("base_url")
+                }
+            }
+        }
+        return Memory.from_config(mem0_config)
+
+    def toggle_mem0(self) -> str:
+        """供 CLI 调用的切换开关"""
+        self.use_mem0 = not self.use_mem0
+        if self.use_mem0:
+            if self.mem0 is None:
+                self.mem0 = self._init_mem0()
+            return "[系统提示] 🟢 已开启 Mem0 动态语义记忆模式 (向量检索)。"
+        else:
+            return "[系统提示] 🔴 已关闭 Mem0，切换回传统 Markdown 静态全量记忆模式。"
+
     # ==========================================
-    # 接口一：短期 JSON 线性工作上下文操作 (向前兼容)
+    # 接口一：短期 JSON 线性工作上下文操作
     # ==========================================
 
     def save_context(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        # 同步写入 JSON
         self._store.save(session_id, messages)
+
+        # 仅在开启 Mem0 时，才执行后台向量化提取
+        if self.use_mem0 and self.mem0:
+            current_turn_messages = []
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    current_turn_messages = messages[i:]
+                    break
+
+            if current_turn_messages:
+                def _background_mem0_add():
+                    try:
+                        self.mem0.add(current_turn_messages, user_id="global_admin")
+                    except Exception as e:
+                        logger.warning(f"后台 Mem0 记忆蒸馏失败 (不影响主流程): {str(e)}")
+
+                threading.Thread(target=_background_mem0_add, daemon=True).start()
 
     def load_context(self, session_id: str) -> List[Dict[str, Any]]:
         return self._store.load(session_id)
@@ -75,11 +160,6 @@ class MemoryManager:
             self._store.save(session_id, trimmed)
 
     def clear_context(self, session_id: str) -> None:
-        """
-        内核级热重置（Hot-Reset）：保留第 0 位的 system 核心人设与工具防线消息，
-        清空其余所有的 user、assistant 和 tool 对话历史，并原地覆写原 JSON 文件。
-        如果没有任何历史消息或未生成文件，则执行安全的物理清理降级。
-        """
         try:
             messages = self.load_context(session_id)
             if messages and messages[0].get("role") == "system":
@@ -97,43 +177,69 @@ class MemoryManager:
         logger.info(f"[Session-{session_id}] 上下文为空或不合法，已完成基础物理清空。")
 
     def list_sessions(self) -> List[str]:
-        return [
-            f.stem for f in self._store._store_dir.iterdir()
-            if f.suffix == ".json"
-        ]
+        return [f.stem for f in self._store._store_dir.iterdir() if f.suffix == ".json"]
 
     # ==========================================
     # 接口二：高级 Markdown 长期记忆分层组装与注入
     # ==========================================
 
-    def load_markdown_memories_as_text(self, session_id: str) -> str:
-        _, claude_md, memory_md = self._get_session_memory_paths(session_id)
+    def load_markdown_memories_as_text(self, session_id: str, current_task: Optional[str] = None) -> str:
         compiled_blocks = []
+        _, claude_md, memory_md = self._get_session_memory_paths(session_id)
 
+        # 1. 加载硬编码的全局极高优先级偏好
         if self.global_pref_file.exists():
             compiled_blocks.append(self.global_pref_file.read_text(encoding="utf-8"))
+
+        # 2. 加载项目显式开发规范 (CLAUDE.md)
         if claude_md.exists():
             compiled_blocks.append(claude_md.read_text(encoding="utf-8"))
-        if memory_md.exists():
-            compiled_blocks.append(memory_md.read_text(encoding="utf-8"))
+
+        # 3. 动态经验注入逻辑 (双分支)
+        if self.use_mem0 and self.mem0 and current_task:
+            # 开启状态：走 Mem0 动态语义检索
+            try:
+                results = self.mem0.search(query=current_task, user_id="global_admin", limit=5)
+                if results:
+                    mem_lines = ["## 从历史执行中动态提取的相关经验与自我约束："]
+                    for res in results:
+                        mem_text = res.get('memory', '') or res.get('text', '')
+                        mem_lines.append(f"- {mem_text}")
+                    compiled_blocks.append("\n".join(mem_lines))
+            except Exception as e:
+                logger.error(f"Mem0 语义检索异常: {str(e)}")
+        else:
+            # 关闭状态：走您原版代码的全局追加模式
+            if memory_md.exists():
+                compiled_blocks.append(memory_md.read_text(encoding="utf-8"))
 
         return "\n***\n".join(compiled_blocks)
 
     # ==========================================
-    # 接口三：自主记忆蒸馏管道 (Auto-Memory Distiller)
+    # 接口三：强行注入的纠错管线 (自主记忆蒸馏)
     # ==========================================
 
     def distill_and_record_correction(self, session_id: str, failed_command: str, correction_context: str) -> None:
-        """
-        【自主学习自愈核心】：将错误教训或 Layer 3 人工驳回原因，采用官方 OpenAI SDK 蒸馏并固化。
-        """
-        try:
-            config = get_llm_config()
-            if not config or not config.get("api_key"):
-                logger.warning("未配置大模型凭证，跳过长期记忆自主蒸馏。")
-                return
+        if self.use_mem0 and self.mem0:
+            # 开启状态：直接调用 Mem0 处理
+            try:
+                correction_statement = (
+                    f"【系统级纠错/人类禁令】在尝试执行 `{failed_command}` 操作时被阻断。 "
+                    f"阻断原因及后续开发规范为: {correction_context}。"
+                )
+                self.mem0.add(correction_statement, user_id="global_admin")
+                logger.info(f"[Session-{session_id}] 已通过 Mem0 成功固化纠错记忆: {correction_context}")
+            except Exception as e:
+                logger.error(f"向 Mem0 注入自愈记忆时发生异常: {str(e)}")
+        else:
+            # 关闭状态：完全恢复您原来基于 OpenAI API 提炼写入 Markdown 的逻辑
+            try:
+                config = get_llm_config()
+                if not config or not config.get("api_key"):
+                    logger.warning("未配置大模型凭证，跳过长期记忆自主蒸馏。")
+                    return
 
-            prompt = f"""你是一个智能体高阶行为经验提炼器（Memory Distiller）。目前某个 AI Agent 在执行任务时触犯了安全、环境或业务逻辑边界，被人类用户/系统强制拦截驳回。
+                prompt = f"""你是一个智能体高阶行为经验提炼器（Memory Distiller）。目前某个 AI Agent 在执行任务时触犯了安全、环境或业务逻辑边界，被人类用户/系统强制拦截驳回。
 请深入剖析本次犯错场景，并为该 Agent 提炼出【一条】极度精炼、不含任何废话和前缀的 Markdown 列表形式的行为备忘准则（行为负向反馈），以警示它下次绝不再犯。
 
 【犯错上下文】
@@ -146,37 +252,33 @@ class MemoryManager:
 
 请直接输出这一行 Markdown 文本：
 """
-            # 初始化官方 OpenAI 同步客户端，继承重试防线
-            client = OpenAI(
-                api_key=config["api_key"],
-                base_url=config["base_url"],
-                max_retries=3
-            )
+                client = OpenAI(
+                    api_key=config["api_key"],
+                    base_url=config["base_url"],
+                    max_retries=3
+                )
 
-            # 调用官方 API
-            response = client.chat.completions.create(
-                model=config["model_name"],
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2
-            )
+                response = client.chat.completions.create(
+                    model=config["model_name"],
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2
+                )
 
-            distilled_rule = response.choices[0].message.content.strip()
+                distilled_rule = response.choices[0].message.content.strip()
 
-            # 清洗包裹标记
-            if distilled_rule.startswith("```"):
-                distilled_rule = distilled_rule.replace("```markdown", "").replace("```", "").strip()
-            if not distilled_rule.startswith("-"):
-                distilled_rule = f"- {distilled_rule}"
+                if distilled_rule.startswith("```"):
+                    distilled_rule = distilled_rule.replace("```markdown", "").replace("```", "").strip()
+                if not distilled_rule.startswith("-"):
+                    distilled_rule = f"- {distilled_rule}"
 
-            # 永久写入共享的长效记忆区
-            _, _, memory_md = self._get_session_memory_paths(session_id)
-            current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-            final_line = f"{distilled_rule} (记录于 {current_date})\n"
+                _, _, memory_md = self._get_session_memory_paths(session_id)
+                current_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+                final_line = f"{distilled_rule} (记录于 {current_date})\n"
 
-            with open(memory_md, "a", encoding="utf-8") as f:
-                f.write(final_line)
+                with open(memory_md, "a", encoding="utf-8") as f:
+                    f.write(final_line)
 
-            logger.info(f"[Session-{session_id}] 成功沉淀一条长效 Markdown 记忆: {distilled_rule}")
+                logger.info(f"[Session-{session_id}] 成功沉淀一条长效 Markdown 记忆: {distilled_rule}")
 
-        except Exception as e:
-            logger.error(f"长期记忆自主蒸馏管道发生异常: {str(e)}")
+            except Exception as e:
+                logger.error(f"传统长期记忆自主蒸馏管道发生异常: {str(e)}")

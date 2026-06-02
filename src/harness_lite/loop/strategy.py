@@ -47,7 +47,7 @@ class ReActStrategy(BaseStrategy):
         # 1. 组装并初始化多租户上下文，将当前的 session_id 稳妥向下透传
         messages = engine.memory.load_context(session_id)
         if not messages:
-            messages = engine.build_initial_messages(task, session_id=session_id)
+            messages = engine.build_hot_swapped_context(task, session_id=session_id)
         else:
             messages.append({"role": "user", "content": task})
 

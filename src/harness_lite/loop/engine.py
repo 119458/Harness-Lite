@@ -110,13 +110,32 @@ class AsyncLoopEngine:
             skills_list=skills_list_str
         )
 
-        prior_memories_md = self.memory.load_markdown_memories_as_text(session_id)
+        prior_memories_md = self.memory.load_markdown_memories_as_text(session_id, current_task=task)
         full_system_prompt = f"{system_content}\n\n【你先前通过学习或被人类纠错沉淀下来的核心长效行为备忘录】\n{prior_memories_md}"
 
         return [
             {"role": "system", "content": full_system_prompt},
             {"role": "user", "content": task}
         ]
+
+    def build_hot_swapped_context(self, task: str, session_id: str = "default") -> List[Dict[str, Any]]:
+        """
+        组装当前回合的完整上下文。强制使用包含最新 Mem0 检索结果的 System 提示词
+        替换掉历史 JSON 中固化的旧提示词，打破冻结陷阱。
+        """
+
+        history_messages = self.memory.load_context(session_id)
+
+        dynamic_initial_msgs = self.build_initial_messages(task, session_id)
+
+        if not history_messages:
+            return dynamic_initial_msgs
+        else:
+            if history_messages[0].get("role") == "system":
+                history_messages[0] = dynamic_initial_msgs[0]
+            history_messages.append({"role": "user", "content": task})
+            return history_messages
+
 
     async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None,
                              status_callback=None) -> Dict[str, Any]:
