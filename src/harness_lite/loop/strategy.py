@@ -45,11 +45,11 @@ class ReActStrategy(BaseStrategy):
                       stream_callback: Optional[Callable[[str], None]] = None,
                       status_callback: Optional[Callable[[str], None]] = None) -> str:
         # 1. 组装并初始化多租户上下文，将当前的 session_id 稳妥向下透传
-        messages = engine.memory.load_context(session_id)
-        if not messages:
-            messages = engine.build_hot_swapped_context(task, session_id=session_id)
-        else:
-            messages.append({"role": "user", "content": task})
+        messages = engine.build_hot_swapped_context(task, session_id)
+        # if not messages:
+        #     messages = engine.build_hot_swapped_context(task, session_id=session_id)
+        # else:
+        #     messages.append({"role": "user", "content": task})
 
         step = 0
         full_response = ""

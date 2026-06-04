@@ -3,6 +3,7 @@ Harness-Lite CLI Application.
 赛博矩阵平衡版：霓虹战术面板与极简输入提示符的完美撞色融合。
 """
 import sys
+import os
 import time
 import typer
 import asyncio
@@ -37,36 +38,68 @@ app = typer.Typer(
 )
 
 
-# ========================================================
-# 🎨 赛博朋克核心调色盘 (Cyberpunk Palettes)
-# 🖥️ #00f0ff (荧光青) | #ff0055 (霓虹粉) | #fdee21 (警告黄)
-# ========================================================
-
 class CyberCommandCompleter(Completer):
-    """赛博朋克专属：黑客指令动态补全菜单（纯中文释义）"""
-
     def __init__(self):
         self.commands = {
-            "/model": "🧬 [核心内核] 探测当前量子神经元大脑模型配置",
-            "/tool": "⚡ [外置义体] 扫描当前接入沙箱的所有原子工具链",
-            "/skill": "📚 [知识芯片] 读取全量常驻 SOP 技能芯片库",
-            "/mem0": "🔮 [深潜外脑] 切换 Mem0 动态语义记忆模式 (默认关闭/传统降级)",
-            "/clear": "🧠 [意识净化] 核心级热重置，洗涤短期交互历史链",
-            "/session": "🌐 [上行视窗] 定位当前加密隔离工作区安全边界",
-            "/exit": "🚨 退出当前cli",
+            "/model": "查看 LLM 底层服务配置",
+            "/tool": "打印当前注册的原子工具链",
+            "/skill": "查看已加载的标准化 SOP 技能芯片",
+            "/mem0": "一键开关 Mem0 图形向量长记忆系统",
+            "/clear": "擦除当前会话的上下文冷记忆 (保留 System)",
+            "/session": "查看当前会话实例与沙箱拓扑详情",
+            "/sandbox": "热动态挂载多物理沙箱环境 (支持传多个路径，以空格分隔)",
+            "/exit": "安全的退出当前赛博交互终端 CLI",
         }
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+
+        # 1. 优先处理 /sandbox 后的多参数当前级物理目录动态补全
+        if text.startswith("/sandbox "):
+            parts = text.split(" ")
+            current_fragment = parts[-1]
+            if current_fragment.endswith("/") or current_fragment.endswith("\\"):
+                dirname = current_fragment
+                basename = ""
+            else:
+                dirname = os.path.dirname(current_fragment)
+                basename = os.path.basename(current_fragment)
+                if current_fragment in (".", ".."):
+                    dirname = current_fragment
+                    basename = ""
+
+            scan_dir = os.path.abspath(dirname) if dirname else os.getcwd()
+            if os.path.isdir(scan_dir):
+                try:
+                    for entry in os.listdir(scan_dir):
+                        if entry.startswith(".") and not basename.startswith("."):
+                            continue
+                        full_path = os.path.join(scan_dir, entry)
+                        if os.path.isdir(full_path) and entry.startswith(basename):
+                            if dirname:
+                                completion_text = f"{dirname.rstrip('/')}/{entry}/"
+                            else:
+                                completion_text = f"{entry}/"
+                            yield Completion(
+                                text=completion_text,
+                                start_position=-len(current_fragment),
+                                display_meta="Directory"
+                            )
+                except Exception:
+                    pass
+            return
+
+        # 2. 传统的斜杠基础命令补全
         if text.startswith("/"):
             for cmd, desc in self.commands.items():
                 if cmd.startswith(text):
+                    # 💡【核心优化点】如果是 /sandbox，补全时自动带一个空格，方便后续直接按 Tab 补全路径
+                    completion_text = f"{cmd} " if cmd == "/sandbox" else cmd
                     yield Completion(
-                        text=cmd,
+                        text=completion_text,
                         start_position=-len(text),
                         display_meta=desc
                     )
-
 
 # 暗黑底色 + 高饱和度霓虹粉/荧光青高反差弹出菜单样式
 cyber_tui_style = Style.from_dict({
@@ -148,13 +181,31 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
         except Exception as e:
             console.print(f"[bold red]❌ [重置失败] 记忆重启中途遭遇硬代码异常: {e}[/bold red]")
 
+    elif cmd == "/sandbox":
+        from harness_lite.security.manager import security_manager
+        if len(parts) < 2:
+            console.print("\n[#00f0ff]📡 当前挂载激活的沙箱工作区集群:[/#00f0ff]")
+            for idx, r in enumerate(sorted(security_manager.active_sandbox_roots), 1):
+                console.print(f"  [#ff0055][{idx:02d}][/#ff0055] ➔ [green]{r}[/green]")
+        else:
+            sandbox_paths = parts[1:]
+            try:
+                security_manager.set_active_sandboxes(sandbox_paths)
+                console.print("\n[bold green]✓ 物理沙箱环境重新挂载成功！AI 授信边界已实时同步：[/bold green]")
+                for idx, r in enumerate(sorted(security_manager.active_sandbox_roots), 1):
+                    console.print(f"  [#ff0055][{idx:02d}][/#ff0055] ➔ [bold green]{r}[/bold green]")
+            except Exception as e:
+                console.print(f"[bold red]❌ 沙箱环境挂载失败: {e}[/bold red]")
+
     elif cmd == "/session":
+        from harness_lite.security.manager import security_manager
+        roots_desc = "\n".join(
+            [f"  [#ff0055]•[/#ff0055] [bright_black]{r}[/bright_black]" for r in security_manager.active_sandbox_roots])
         panel_content = (
-            f"[#00f0ff]» 隔离矩阵路径:[/#00f0ff] [green]session://{session_id}[/green]\n"
-            f"[#00f0ff]» 沙箱安全边界:[/#00f0ff] [bright_black]sandbox/session_{session_id}/work/[/bright_black]"
+            f"[#00f0ff]会话 ID:[/#00f0ff] [green]session://{session_id}[/green]\n"
+            f"[#00f0ff]已授权沙箱集群:[/#00f0ff]\n{roots_desc}"
         )
-        console.print(Panel(panel_content, title="[#fdee21]◢ 加密上行活跃节点详情 ◤[/#fdee21]", border_style="#00f0ff",
-                            expand=False))
+        console.print(Panel(panel_content, title="[#fdee21] 运行状态 [/#fdee21]", border_style="#00f0ff", expand=False))
 
     else:
         console.print(f"[bold red]❌ [语法错误] 未识别的矩阵指令: {cmd}。请按下 '/' 调出赛博指令菜单。[/bold red]")
@@ -351,14 +402,24 @@ async def run_interactive_async(session_id: str) -> None:
     # 【架构级优化】：只在交互会话启动时实例化一次 Engine。
     # 这样 engine.memory 里的 use_mem0 状态就能在整个聊天期间一直保存！
     global_engine = AsyncLoopEngine()
+    from prompt_toolkit.key_binding import KeyBindings
+    kb = KeyBindings()
+
+    @kb.add('enter')
+    def _(event):
+        buffer = event.current_buffer
+        if buffer.complete_state and buffer.complete_state.current_completion:
+            buffer.complete_state = None
+        else:
+            buffer.validate_and_handle()
 
     session = PromptSession(
         history=InMemoryHistory(),
         completer=CyberCommandCompleter(),
         style=cyber_tui_style,
-        complete_while_typing=True
+        complete_while_typing=True,
+        key_bindings=kb
     )
-
     prompt_message = HTML("<ansicyan><b> ＞</b></ansicyan>")
 
     while True:

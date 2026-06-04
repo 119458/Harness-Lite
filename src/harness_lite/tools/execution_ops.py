@@ -177,8 +177,7 @@ class IsolatedPersistentShell:
                             try:
                                 exit_code = int(parts[-2])
                                 reported_cwd = parts[-1]
-                                session_root = security_manager.get_session_workspace(self.session_id)
-                                if not Path(reported_cwd).resolve().is_relative_to(session_root):
+                                if not security_manager.is_path_safe(Path(reported_cwd)):
                                     self._heal_and_revert()
                                     return f"[Security Escape Blocked] 警告: 检测到当前命令试图将工作目录切换至沙箱外部 '{reported_cwd}'。此操作已被拦截，环境已强制回滚复位。", -3
                                 self.last_known_cwd = reported_cwd

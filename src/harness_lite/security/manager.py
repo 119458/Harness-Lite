@@ -3,7 +3,7 @@ import re
 import ast
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Set
 from datetime import datetime
 
 # 【核心替换点】引入官方 OpenAI 同步客户端
@@ -83,18 +83,23 @@ class PythonASTAuditor(ast.NodeVisitor):
 
 
 class SecurityManager:
-    """安全管理器：负责全链路多层防御（静态硬防 -> 语义推导 -> 人工终审）与 Session 沙箱隔离"""
+    """多维度安全审计拦截器（已解除 Session 强绑定，支持多沙箱工作区动态挂载）"""
 
     def __init__(self):
         self._audit_log: list = []
         current_file = Path(__file__).resolve()
         project_root = current_file.parent.parent.parent.parent
         workspace_env = os.environ.get("WORKSPACE_ROOT")
+        self.active_sandbox_roots: Set[Path] = set()
         if workspace_env:
-            self.base_workspace_root = Path(workspace_env).resolve()
+            for p in workspace_env.split(","):
+                if p.strip():
+                    self.active_sandbox_roots.add(Path(p.strip()).resolve())
         else:
-            self.base_workspace_root = (project_root / "sandbox").resolve()
-        self.base_workspace_root.mkdir(parents=True, exist_ok=True)
+            self.active_sandbox_roots.add((project_root / "sandbox").resolve())
+
+        for r in self.active_sandbox_roots:
+            r.mkdir(parents=True, exist_ok=True)
 
         self.dangerous_shell_patterns = [
             r"\bsudo\b",
@@ -108,25 +113,69 @@ class SecurityManager:
             r"\bmv\b\s+.*\s+/(?:etc|usr|bin|lib|var)",
         ]
 
+    def set_active_sandboxes(self, paths: list) -> None:
+        """
+        动态管理物理沙箱集群。
+        1. 默认行为：追加（Add）新路径并自动去重。
+        2. /sandbox reset : 一键重置回 .env 或默认底座配置。
+        3. /sandbox remove 路径 : 从当前集群中移除特定沙箱。
+        """
+        if not paths:
+            return
+        if paths[0] == "reset":
+            self.active_sandbox_roots.clear()
+            workspace_env = os.environ.get("WORKSPACE_ROOT")
+            if workspace_env:
+                for p in workspace_env.split(","):
+                    if p.strip():
+                        self.active_sandbox_roots.add(Path(p.strip()).resolve())
+            else:
+                current_file = Path(__file__).resolve()
+                project_root = current_file.parent.parent.parent.parent
+                self.active_sandbox_roots.add((project_root / "sandbox").resolve())
+            return
+        if paths[0] in ("remove", "-r") and len(paths) > 1:
+            for p in paths[1:]:
+                resolved = Path(p.strip()).resolve()
+                self.active_sandbox_roots.discard(resolved)
+            return
+        for p in paths:
+            path_str = p.strip()
+            if path_str:
+                resolved = Path(path_str).resolve()
+                resolved.mkdir(parents=True, exist_ok=True)
+                self.active_sandbox_roots.add(resolved)
+
     def get_session_workspace(self, session_id: str) -> Path:
-        session_root = (self.base_workspace_root / f"session_{session_id}").resolve()
-        session_root.mkdir(parents=True, exist_ok=True)
-        return session_root
+        """重构：解耦 Session，默认返回当前主工作区（第一个挂载点），用于放置临时执行脚本"""
+        if self.active_sandbox_roots:
+            return list(self.active_sandbox_roots)[0]
+        return Path(".").resolve()
+
+    def is_path_safe(self, target_path: Path) -> bool:
+        """检查任意绝对路径是否落在当前已激活的任意一个沙箱工作区内"""
+        try:
+            resolved = target_path.resolve()
+            for root in self.active_sandbox_roots:
+                if resolved.is_relative_to(root):
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _check_path_jail(self, target_path: str, session_id: str) -> Tuple[bool, str]:
+        """重构路径越狱检查：多工作区全覆盖校验"""
         try:
-            session_root = self.get_session_workspace(session_id)
             p = Path(target_path)
             if not p.is_absolute():
-                resolved_path = (session_root / p).resolve()
+                resolved_path = (self.get_session_workspace(session_id) / p).resolve()
             else:
                 resolved_path = p.resolve()
-
-            if not resolved_path.is_relative_to(session_root):
-                return False, f"Sandbox Violations: 尝试访问 Session 沙箱外部路径 '{resolved_path}'。"
+            if not self.is_path_safe(resolved_path):
+                return False, f"Sandbox Violations: 目标路径 '{resolved_path}' 不在任何已激活的沙箱授信范围内！"
             return True, str(resolved_path)
         except Exception as e:
-            return False, f"Path Resolution Error: 路径解析异常 ({str(e)})"
+            return False, f"Path Resolution Error: ({str(e)})"
 
     def _validate_layer1_static(self, tool_name: str, input_data: Dict[str, Any], session_id: str) -> Tuple[bool, str]:
         if tool_name in ["read_file", "create_file", "edit_file"]:

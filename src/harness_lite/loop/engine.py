@@ -4,7 +4,6 @@ Loop engine module.
 Fully patched industrial version utilizing the official OpenAI Python SDK
 with advanced delta null-guards and surrogate sanitization to prevent all stream crashes.
 """
-import os
 from typing import Dict, Any, List, Optional, Callable
 import json
 import asyncio
@@ -24,9 +23,9 @@ from harness_lite.tools.execution_ops import current_session_id
 SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂的系统任务。
 
 【环境与沙箱状态】
-- 当前工作区（沙箱）绝对路径: {workspace_root}
-- 安全限制: 你的所有文件读取、创建、编辑以及终端操作，都必须严格限制在上述工作区范围内。系统已开启沙箱拦截，任何试图访问该目录之外（如 /etc, ~/.ssh 等）的操作都会被强制拒绝。
-- 路径建议: 在调用文件工具（如 create_file, edit_file）或终端执行时，请优先使用**相对于当前工作区的相对路径**（例如直接使用 `src/main.py` ）。
+当前系统为你安全挂载并挂牌授权了多个物理沙箱工作区(Workspace Roots)，列表如下：
+{workspace_roots}
+注意：你对文件的创建(create_file)、编辑(edit_file)、读取(read_file)及终端操作(bash_terminal)等所有原子工具的输入路径，都必须绝对约束在上述挂载的工作区路径范围内。严禁探出边界去访问系统级的敏感文件（如 /etc, ~/.ssh）。
 
 【可用物理工具】
 {tools_schema}
@@ -101,11 +100,12 @@ class AsyncLoopEngine:
         else:
             skills_list_str = "当前未加载任何特定的业务技能指南。"
 
-        # 联动安全管理器，实时获取该租户独占的物理子文件夹
-        sandbox_absolute_path = str(self.security.get_session_workspace(session_id))
+        # 提取并渲染多工作区集群字符串给大模型
+        sorted_roots = sorted(self.security.active_sandbox_roots)
+        roots_str = "\n".join([f"  - `{r}`" for r in sorted_roots])
 
         system_content = SYSTEM_PROMPT.format(
-            workspace_root=sandbox_absolute_path,
+            workspace_roots=roots_str,
             tools_schema=json.dumps(tools_schema, ensure_ascii=False),
             skills_list=skills_list_str
         )
