@@ -4,6 +4,7 @@ Loop engine module.
 Fully patched industrial version utilizing the official OpenAI Python SDK
 with advanced delta null-guards and surrogate sanitization to prevent all stream crashes.
 """
+from random import choice
 from typing import Dict, Any, List, Optional, Callable
 import json
 import asyncio
@@ -133,8 +134,12 @@ class AsyncLoopEngine:
         else:
             if history_messages[0].get("role") == "system":
                 history_messages[0] = dynamic_initial_msgs[0]
-            history_messages.append({"role": "user", "content": task})
-            return history_messages
+            cleaned_history = [m for m in history_messages if not m.get("is_meta")]
+            cleaned_history.append({
+                "role": "user",
+                "content": task
+            })
+            return cleaned_history
 
 
     async def call_llm_async(self, messages: List[Dict[str, Any]], stream: bool = False, stream_callback=None,
@@ -198,6 +203,7 @@ class AsyncLoopEngine:
         full_reasoning_content = ""
         tool_calls_dict = {}
         notified_tool_call = False
+        final_finish_reason = "stop"
 
         is_thinking = config.get("thinking_mode", False)
         extra_body = {
@@ -221,7 +227,8 @@ class AsyncLoopEngine:
             async for chunk in response_stream:
                 if not chunk.choices:
                     continue
-                delta = chunk.choices[0].delta
+                choice = chunk.choices[0]
+                delta = choice.delta
 
                 # ========================================================
                 # 【🔥 核心修复防线】极其严密地拦截并跳过第三方网关下发的恶意空 delta 对象，
@@ -229,6 +236,9 @@ class AsyncLoopEngine:
                 # ========================================================
                 if delta is None:
                     continue
+
+                if choice.finish_reason:
+                    final_finish_reason = choice.finish_reason
 
                 if config.get("thinking_mode"):
                     reasoning_chunk = getattr(delta, "reasoning_content", None)
@@ -276,13 +286,13 @@ class AsyncLoopEngine:
             if config.get("thinking_mode") and full_reasoning_content:
                 res_message["reasoning_content"] = full_reasoning_content
 
-            return {"choices": [{"message": res_message}]}
+            return {"choices": [{"message": res_message, "finish_reason": final_finish_reason}]}
 
         except Exception as e:
             error_msg = f"\n[API 流式错误] SDK 传输流遭遇未知中断. 详情: {str(e)}\n"
             if stream_callback:
                 stream_callback(error_msg)
-            return {"choices": [{"message": {"content": error_msg}}]}
+            return {"choices": [{"message": {"content": error_msg}, "finish_reason": "error"}]}
 
     async def _safe_execute_tool_wrapper(self, call_id: str, tool_name: str, arguments: Dict[str, Any],
                                          session_id: str) -> Dict[str, Any]:
