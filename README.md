@@ -63,6 +63,14 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 默认加载.env环境变量中的WORKSPACE_ROOT值，其可以传入多个地址，使用，进行分隔即可。
 - 最后这个功能会弃用，因为当前怕大模型返回的结果会损害本地文件，所以强制将其锁死在指定的路径下。
 
+# 🚀 [2026-06-10] 对loop循环进行优化
+- 将整体接口合规化
+- 集中管理所有**异常恢复预算**，杜绝 `except Exception` 兜底带来的死循环
+- 引入 **L1 QueryEngine / L2 strategy** 双层职责切分
+- 为并行工具执行、多级 compaction、Hook 框架预留可演进接口
+- 整体修改在loop文件夹中。
+- 本次修改主要采用vibe coding方式
+
 
 ## 架构
 

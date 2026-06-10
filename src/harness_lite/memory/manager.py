@@ -13,8 +13,7 @@ import threading
 
 # 引入官方 OpenAI 同步客户端 (用于传统模式的自动蒸馏)
 from openai import OpenAI
-# 引入 Mem0 核心记忆器
-from mem0 import Memory
+# 注意：mem0 为可选依赖。仅在 toggle_mem0() / _init_mem0() 中方引入。
 
 from .store import MemoryStore
 from harness_lite.config.loader import get_llm_config
@@ -65,8 +64,15 @@ class MemoryManager:
 
         return persistent_dir, claude_md, memory_md
 
-    def _init_mem0(self) -> Memory:
-        """初始化 Mem0 引擎"""
+    def _init_mem0(self):
+        """初始化 Mem0 引擎（延迟导入，避免未安装 mem0 时整个 Memory 模块崩溃）。"""
+        try:
+            from mem0 import Memory
+        except ImportError as e:
+            raise RuntimeError(
+                "[Mem0 未安装] 请先 `pip install mem0ai` 并配置 embedding 模型 API 后再启用 /mem0。"
+            ) from e
+
         config = get_llm_config()
         current_model = config.get("model_name", "gpt-3.5-turbo")
 
@@ -117,12 +123,19 @@ class MemoryManager:
 
     def toggle_mem0(self) -> str:
         """供 CLI 调用的切换开关"""
-        self.use_mem0 = not self.use_mem0
-        if self.use_mem0:
-            if self.mem0 is None:
-                self.mem0 = self._init_mem0()
+        if not self.use_mem0:
+            # 开启前先尝试初始化，捕获 mem0 未安装/未配置的异常
+            try:
+                if self.mem0 is None:
+                    self.mem0 = self._init_mem0()
+            except RuntimeError as e:
+                return f"[系统提示] ⚠️ Mem0 启用失败: {e}"
+            except Exception as e:
+                return f"[系统提示] ⚠️ Mem0 初始化异常: {e}"
+            self.use_mem0 = True
             return "[系统提示] 🟢 已开启 Mem0 动态语义记忆模式 (向量检索)。"
         else:
+            self.use_mem0 = False
             return "[系统提示] 🔴 已关闭 Mem0，切换回传统 Markdown 静态全量记忆模式。"
 
     # ==========================================

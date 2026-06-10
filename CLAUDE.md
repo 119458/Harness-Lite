@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-本文件为 Claude Code (claude.ai/code) 在此代码库中工作时提供指导。
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## 项目概述
 
@@ -9,7 +9,7 @@ Harness-Lite 是一个轻量级大模型多智能体编排框架，支持异步�
 ## 常用命令
 
 ```bash
-# 安装包
+# 安装包（开发模式）
 pip install -e .
 
 # 运行 CLI
@@ -17,8 +17,11 @@ harness-lite "任务"                     # 单轮对话
 harness-lite -i                        # 交互模式（自动生成会话）
 harness-lite -i --session <id>         # 继续指定会话
 
-# 运行测试
+# 运行全部测试
 pytest tests/ -v
+
+# 运行单个测试模块
+pytest tests/test_security.py -v
 ```
 
 ## 架构
@@ -45,22 +48,49 @@ Config → Memory → Registry → Security → Loop (Engine + Strategy) → CLI
 
 | 模块 | 路径 | 职责 |
 |------|------|------|
-| **Config** | `config/loader.py` | 从 `.env` 加载 LLM 配置 |
-| **Memory** | `memory/manager.py`, `memory/store.py` | 三层记忆管理系统 |
+| **Config** | `config/loader.py` | 从 `.env` 加载 LLM 配置（全局单例） |
+| **Memory** | `memory/manager.py`, `memory/store.py` | 三层记忆 + mem0 向量长记忆 |
 | **Context** | `context/manager.py` | Token 级自适应上下文压缩引擎 |
 | **Registry** | `registry/base.py` | `Tool` 和 `Skill` 抽象基类 |
 | **ToolRegistry** | `registry/tool_registry.py` | 插件注册表 |
 | **SkillRegistry** | `registry/skill_registry.py` | 技能注册表 |
-| **Security** | `security/manager.py` | 三层安全防御 + Session 沙箱隔离 |
+| **Security** | `security/manager.py` | 三层安全防御 + Session 沙箱隔离 + 多沙箱挂载 |
 | **AsyncLoopEngine** | `loop/engine.py` | 异步 LLM 编排器 |
 | **ReActStrategy** | `loop/strategy.py` | ReAct 循环策略 + 熔断机制 |
-| **CLI** | `cli/app.py` | Typer 应用 + 流式输出 |
+| **CLI** | `cli/app.py` | Typer + prompt_toolkit 交互式终端 |
+
+## .env 配置
+
+必须配置的环境变量（项目根目录 `.env`）：
+
+| 变量 | 必需 | 说明 |
+|------|------|------|
+| `LLM_API_KEY` | 是 | LLM API 密钥 |
+| `LLM_BASE_URL` | 是 | API 端点（兼容 OpenAI 格式即可） |
+| `LLM_MODEL_NAME` | 是 | 模型标识符 |
+| `LLM_THINKING_MODE` | 否 | `true`/`false`，开启思维链输出 |
+| `WORKSPACE_ROOT` | 否 | 沙箱根路径，多路径用逗号分隔 |
+
+## CLI 斜杠命令
+
+交互模式下可用（`/` 触发自动补全）：
+
+| 命令 | 功能 |
+|------|------|
+| `/model` | 查看 LLM 配置与思维链模式 |
+| `/tool` | 列出已注册的原子工具 |
+| `/skill` | 列出已加载的 SOP 技能 |
+| `/mem0` | 开关 mem0 向量长记忆系统 |
+| `/clear` | 清空当前会话短期记忆 |
+| `/session` | 查看会话 ID 与沙箱信息 |
+| `/sandbox [路径...]` | 动态挂载沙箱；无参数则列出当前；`reset` 重置为 .env 默认 |
+| `/exit` | 退出 CLI |
 
 ## 三层安全防御体系
 
 ### Layer 1 - 确定性静态防御
 - **AST 语法审计** (`PythonASTAuditor`)：拦截 `eval/exec/compile/__import__`，禁止 `subprocess` 模块，封锁 `system/popen/spawn*/execl*/fork/ctypes` 等危险属性
-- **路径沙箱** (`_check_path_jail`)：所有文件操作重写为 Session 专属目录 `sandbox/session_{session_id}/`
+- **路径沙箱** (`_check_path_jail`)：所有文件操作重写为授权沙箱目录内，支持多沙箱路径挂载
 - **危险 Shell 正则拦截**：匹配 `sudo`、`rm -rf`、`chmod 0777`、`curl|wget |bash` 等高危指令
 
 ### Layer 2 - LLM 语义审查
@@ -86,6 +116,12 @@ Config → Memory → Registry → Security → Loop (Engine + Strategy) → CLI
 - 当 Layer 3 人工拒绝操作时，调用 LLM 将错误提炼为单条行为准则
 - 格式：`- [纠错] 在处理XXXX时，严禁使用XXXX，必须通过XXXX来实现。`
 - 持久化写入 `MEMORY.md`，跨会话共享
+
+### mem0 向量长记忆（可选）
+- 通过 `/mem0` 命令启用，默认关闭
+- 每次对话结束时对回答内容进行向量化和存储
+- 每次用户提问时从数据库检索最相关的 5 条数据注入 system prompt
+- 需要配置 embedding 模型 API，使用 Chroma 数据库（仅支持语义检索）
 
 ## 12 个内置工具
 
@@ -161,17 +197,6 @@ class Skill:
 - **单次输出截断**：超过 3500 字符的工具结果自动截断，防止上下文溢出
 - **流式输出**：字符级打字机效果 + 状态滚动显示
 
-## 会话隔离架构
-
-```
-sandbox/
-├── session_default/
-├── session_session-1747200000/
-└── session_session-1747200001/
-    ├── work/           # 文件操作根目录
-    └── (temp files)    # Python 临时脚本
-```
-
 ## 重要实现说明
 
 ### 工具 Schema 格式
@@ -188,17 +213,23 @@ sandbox/
 ```
 
 ### LLM 集成
-- 默认使用 MiniMax API（通过 `.env` 配置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL_NAME`）
+- 使用兼容 OpenAI 格式的 API（通过 `.env` 配置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL_NAME`）
 - 安全审计使用官方 `OpenAI` SDK（同步客户端，内置 3 次自动重试）
-- API 调用通过 `httpx.AsyncClient` 流式 SSE 响应
+- API 调用通过 `AsOpenAI` 流式 SSE 响应
 - 3 倍指数退避重试（网络错误）
 
 ### Session ID 传递
 - 通过 `contextvars.ContextVar` 在工具执行时动态获取当前 Session ID
 - `BashTerminalTool` 和 `PythonInterpreterTool` 使用此机制实现租户隔离
 
+### 消息净化
+- 流式响应中跳过第三方网关下发的空碎片（空对象）
+- 递归清洗净化器在序列化前剔除非法 Surrogate 字符，防止编码崩溃
+- `reasoning_content` 字段被忽略，只提取 `content` 作为回复
+
 ## 常见错误模式（见 .claude/ERRORS.md）
 
 - Typer `Option()` 返回 `OptionInfo` - 需要手动解析 `sys.argv` 获取实际值
 - 流式输出必须用 `sys.stdout.write()` + flush，禁止用 `print()`
 - 工具调用中间响应不应展示给用户
+- 非标准编码字符会污染历史导致序列化崩溃 - 需在入参前递归净化 Surrogate

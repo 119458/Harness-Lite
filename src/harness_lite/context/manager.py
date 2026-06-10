@@ -20,7 +20,7 @@ class DynamicContextManager:
     """
     动态上下文管理器：负责自适应 Token 计算、插槽监控与历史自动化‘记忆收缩’合并
     """
-    def __init__(self, max_allowed_tokens: int = 64000, model_name: str = "gpt-40-mini"):
+    def __init__(self, max_allowed_tokens: int = 64000, model_name: str = "gpt-4-mini"):
         """
         初始化动态上下文管理器。
 

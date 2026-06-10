@@ -15,6 +15,7 @@ __pycache__/
 # Session memory (local dev)
 memory_store/
 sandbox/
+adopt-code/
 
 # macOS
 .DS_Store

@@ -5,7 +5,7 @@ Fully patched industrial version utilizing the official OpenAI Python SDK
 with advanced delta null-guards and surrogate sanitization to prevent all stream crashes.
 """
 from random import choice
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
 import json
 import asyncio
 
@@ -20,6 +20,9 @@ from harness_lite.config.loader import get_llm_config
 
 # 物理执行层的会话上下文变量，打通全链路 Session 追踪
 from harness_lite.tools.execution_ops import current_session_id
+
+# 阶段 A 引入的消息类型（暂作中间表示，B1 不改外部签名）
+from harness_lite.loop.messages import StreamEvent
 
 SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂的系统任务。
 
@@ -83,7 +86,17 @@ class AsyncLoopEngine:
                   status_callback: Callable[[str], None] = None) -> str:
         # 协程入口层：强制绑定当前异步上下文的 session_id 状态
         current_session_id.set(session_id)
-        return await self.strategy.execute(task, self, session_id, stream_callback, status_callback)
+
+        # B2 阶段：委托 QueryEngine 执行
+        from harness_lite.loop.query_engine import QueryEngine
+
+        engine = QueryEngine(engine=self, session_id=session_id)
+        result = await engine._consume_to_result(
+            stream_callback=stream_callback,
+            status_callback=status_callback,
+        )(task)
+
+        return result.text
 
     def build_initial_messages(self, task: str, session_id: str = "default") -> List[Dict[str, str]]:
         """
@@ -188,75 +201,166 @@ class AsyncLoopEngine:
                 response = await client.chat.completions.create(**kwargs)
                 return response.model_dump()
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             error_msg = f"\n[API 核心错误] OpenAI SDK 基础通信崩溃. 详情: {str(e)}\n"
             if stream_callback:
                 stream_callback(error_msg)
             return {"choices": [{"message": {"content": error_msg}}]}
+        finally:
+            # 修复隐患：AsyncOpenAI 客户端用完即关，避免长会话连接数泄漏
+            try:
+                await client.close()
+            except Exception:
+                pass
 
     async def _call_llm_stream_async(self, client: AsyncOpenAI, config: Dict[str, Any], messages: List[Dict[str, Any]],
                                      tools: Optional[List[Any]], stream_callback, status_callback) -> Dict[str, Any]:
         """
-        利用 OpenAI SDK 实现结构化流式消息处理，带有点对点强制判空安全网
+        【B1 适配层】消费 `_stream_llm_events` 生成器并聚合为旧版 dict 返回值。
+        外部签名与返回结构与 B1 之前完全一致，保证 strategy 零改动。
         """
         full_content = ""
         full_reasoning_content = ""
-        tool_calls_dict = {}
-        notified_tool_call = False
+        tool_calls_list: List[Dict[str, Any]] = []
         final_finish_reason = "stop"
 
+        try:
+            async for event in self._stream_llm_events(client, config, messages, tools, status_callback):
+                etype = event.type
+                data = event.data
+
+                if etype == "message_delta":
+                    if "content" in data:
+                        chunk_text = data["content"]
+                        full_content += chunk_text
+                        if stream_callback:
+                            stream_callback(chunk_text)
+                    if "reasoning_content" in data:
+                        full_reasoning_content += data["reasoning_content"]
+                        # status_callback 已在生成器内部处理思考流推送，这里仅累计
+
+                elif etype == "message_stop":
+                    final_finish_reason = data.get("finish_reason", "stop")
+                    final_tool_calls = data.get("tool_calls")
+                    if final_tool_calls:
+                        tool_calls_list = final_tool_calls
+
+                elif etype == "api_error":
+                    # 生成器内部已 yield 过 error 事件；这里走兜底字符串路径
+                    error_msg = data.get("message", "[未知 API 错误]")
+                    if stream_callback:
+                        stream_callback(error_msg)
+                    return {"choices": [{"message": {"content": error_msg}, "finish_reason": "error"}]}
+
+                # message_start 仅供 usage 统计，B1 暂不消费
+
+            res_message: Dict[str, Any] = {
+                "content": full_content,
+                "tool_calls": tool_calls_list if tool_calls_list else None,
+            }
+            if config.get("thinking_mode") and full_reasoning_content:
+                res_message["reasoning_content"] = full_reasoning_content
+
+            return {"choices": [{"message": res_message, "finish_reason": final_finish_reason}]}
+
+        except asyncio.CancelledError:
+            # 上层取消必须重抛，不能吞掉
+            raise
+        except Exception as e:
+            error_msg = f"\n[API 流式错误] SDK 传输流遭遇未知中断. 详情: {str(e)}\n"
+            if stream_callback:
+                stream_callback(error_msg)
+            return {"choices": [{"message": {"content": error_msg}, "finish_reason": "error"}]}
+
+    async def _stream_llm_events(
+        self,
+        client: AsyncOpenAI,
+        config: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Any]],
+        status_callback,
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """
+        【B1 协议层】将 OpenAI 流式响应转化为结构化 StreamEvent 序列。
+
+        事件类型：
+        - message_start: 开始接收（携带 model 信息）
+        - message_delta: 增量 chunk（content / reasoning_content / tool_call 累加片段）
+        - message_stop:  本次流结束（携带 finish_reason 与最终聚合的 tool_calls）
+        - api_error:     SDK 通信异常（携带 message）
+
+        注意：
+        1. tool_calls 的增量在内部状态机累加，仅在 message_stop 时一次性以完整结构 yield，
+           避免下游消费方反复合并不完整的 chunk。
+        2. status_callback 在思考流（reasoning_content）下仍由本函数推送，保持现有 UI 行为不变。
+        3. 整个过程内部不调用 stream_callback；由上层（_call_llm_stream_async 或 query_engine）
+           根据 message_delta 自行决定 UI 反馈。
+        """
         is_thinking = config.get("thinking_mode", False)
         extra_body = {
-            "thinking": {"type": "enabled" if is_thinking else "disabled"},  # DeepSeek 官方原生标准协议
-            "enable_thinking": is_thinking,  # 阿里云 DashScope / Qwen 混合思考系列标准
-            "chat_template_kwargs": {"thinking": is_thinking}  # vLLM 开源部署自适应模板指令标准
+            "thinking": {"type": "enabled" if is_thinking else "disabled"},
+            "enable_thinking": is_thinking,
+            "chat_template_kwargs": {"thinking": is_thinking},
         }
 
         kwargs = {
             "model": config["model_name"],
             "messages": messages,
             "stream": True,
-            "extra_body": extra_body
+            "extra_body": extra_body,
         }
         if tools:
             kwargs["tools"] = tools
+
+        tool_calls_dict: Dict[int, Dict[str, Any]] = {}
+        notified_tool_call = False
+        final_finish_reason = "stop"
+        started = False
 
         try:
             response_stream = await client.chat.completions.create(**kwargs)
 
             async for chunk in response_stream:
+                if not started:
+                    started = True
+                    yield StreamEvent(type="message_start", data={"model": config.get("model_name")})
+
                 if not chunk.choices:
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
 
-                # ========================================================
-                # 【🔥 核心修复防线】极其严密地拦截并跳过第三方网关下发的恶意空 delta 对象，
-                # 彻底解决 'NoneType' object has no attribute 'content' 崩溃！
-                # ========================================================
+                # 拦截第三方网关空 delta（核心防御）
                 if delta is None:
                     continue
 
                 if choice.finish_reason:
                     final_finish_reason = choice.finish_reason
 
-                if config.get("thinking_mode"):
+                # 思维链增量
+                if is_thinking:
                     reasoning_chunk = getattr(delta, "reasoning_content", None)
                     if reasoning_chunk:
-                        full_reasoning_content += reasoning_chunk
                         if status_callback:
                             clean_reasoning = reasoning_chunk.replace("\n", " ").strip()
                             if clean_reasoning:
                                 status_callback(f"[🧠 思考中] {clean_reasoning}")
+                        yield StreamEvent(
+                            type="message_delta",
+                            data={"reasoning_content": reasoning_chunk},
+                        )
 
-                # 1. 安全流式抽取纯文本
-                if hasattr(delta, 'content') and delta.content:
-                    full_content += delta.content
-                    if stream_callback:
-                        stream_callback(delta.content)
+                # 文本增量
+                if hasattr(delta, "content") and delta.content:
+                    yield StreamEvent(
+                        type="message_delta",
+                        data={"content": delta.content},
+                    )
 
-                # 2. 安全流式结构化累加工具参数
-                if hasattr(delta, 'tool_calls') and delta.tool_calls:
+                # 工具调用增量（内部累加，message_stop 时一次性吐完整结构）
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
                     if not notified_tool_call and status_callback:
                         status_callback("[🧠 思考中] 模型决定调用外部能力，正在构造参数...")
                         notified_tool_call = True
@@ -267,7 +371,7 @@ class AsyncLoopEngine:
                             tool_calls_dict[idx] = {
                                 "id": tc_chunk.id or f"call_{id(tc_chunk)}",
                                 "type": "function",
-                                "function": {"name": "", "arguments": ""}
+                                "function": {"name": "", "arguments": ""},
                             }
                         if tc_chunk.id:
                             tool_calls_dict[idx]["id"] = tc_chunk.id
@@ -278,21 +382,19 @@ class AsyncLoopEngine:
                                 tool_calls_dict[idx]["function"]["arguments"] += tc_chunk.function.arguments
 
             final_tool_calls = list(tool_calls_dict.values()) if tool_calls_dict else None
+            yield StreamEvent(
+                type="message_stop",
+                data={"finish_reason": final_finish_reason, "tool_calls": final_tool_calls},
+            )
 
-            res_message = {
-                "content": full_content,
-                "tool_calls": final_tool_calls
-            }
-            if config.get("thinking_mode") and full_reasoning_content:
-                res_message["reasoning_content"] = full_reasoning_content
-
-            return {"choices": [{"message": res_message, "finish_reason": final_finish_reason}]}
-
+        except asyncio.CancelledError:
+            # 必须重抛，让上层 finally 闭合资源
+            raise
         except Exception as e:
-            error_msg = f"\n[API 流式错误] SDK 传输流遭遇未知中断. 详情: {str(e)}\n"
-            if stream_callback:
-                stream_callback(error_msg)
-            return {"choices": [{"message": {"content": error_msg}, "finish_reason": "error"}]}
+            yield StreamEvent(
+                type="api_error",
+                data={"message": f"\n[API 流式错误] SDK 传输流遭遇未知中断. 详情: {str(e)}\n"},
+            )
 
     async def _safe_execute_tool_wrapper(self, call_id: str, tool_name: str, arguments: Dict[str, Any],
                                          session_id: str) -> Dict[str, Any]:
