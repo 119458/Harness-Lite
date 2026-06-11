@@ -13,20 +13,22 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - **安全拦截**：权限校验、输入验证与审计日志
 - **LLM 编排**：流式响应、工具调用循环与对话历史管理
 
-## 🚀 [2026-05-18] 循环编排功能优化
+## 持续优化中
+
+### 🚀 循环编排功能优化
 - **异步并发调度 (Async Parallel Dispatch)**：基于 `asyncio` 与大模型 Parallel Tool Calling 能力，支持在同一回合内并发执行多个独立工具，极大降低网络 I/O 耗时。
 - **自省容错与熔断 (Error Recovery & Circuit Breaker)**：内置大模型 JSON 格式纠错重试、工具执行异常隔离与反馈引擎，以及达到最大推理步数后的系统级熔断保护。
 - **沉浸式终端交互 (Immersive CLI UI)**：终端内置滚动状态指示器（平滑展示大模型思考与工具并行的中间态日志），并配备打字机式丝滑流式输出。
 - **策略模式编排 (Strategy Orchestration)**：解耦底层引擎与编排逻辑，内置高度容错的 `ReActStrategy`，可轻松扩展至图驱动 (Graph) 或 Plan-and-Execute 等复杂流转模式。
 
-## 🚀 [2026-05-19] 构建完备的tool与skill技能
+### 🚀 构建完备的tool与skill技能
 - 添加常规了文件创建、查找、修改等功能
 - 增加了可运行终端的tool(目前还比较初级)
 - 增加了搜索tool
 - 增加了skill技能工具
 - 详细信息查看function_description中的tool-skill-2026-5-19.md
 
-## 🚀 [2026-05-26] 构建security和memory
+### 🚀 构建security和memory
 - 建立3级审查安全，当不通过时交由人工判断
 - 建立短期记忆和长期记忆（md文件）
 - 上下文智能压缩，先压缩工具调用 -> 早期记忆(默认上下午64k)
@@ -36,11 +38,11 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
   生成一个贪吃蛇程序并运行，其会在规定的沙箱环境中生成一份py代码并在创建的子进程上调用程序
   可以成功调用crate，edit，bash等工具。
 
-## 🚀 [2026-05-27] cli优化和添加模型思考开关
+### 🚀 cli优化和添加模型思考开关
 - 将之前通过input的用户输出改为prompt_toolkit库来处理，异步处理用户输入，使得终端的用户输入连续不卡顿
 - 在.env中添加LLM_THINKING_MODE=false/true的关键字，可以开启大模型思考获取关闭大模型思考
 
-## 🚀 [2026-05-29] cli添加/命令
+### 🚀 cli添加/命令
 - /model: 查看当前大语言模型名称及内核运行模式,
 - /tool: 列出当前沙箱内核中注册的所有原子工具 (Tools),
 - /skill: 列出当前系统已加载的全部纯文本 SOP 技能书,
@@ -48,13 +50,13 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - /session: 查看当前活跃会话的 Session ID 与存储详情,
 - /exit: 优雅安全地退出整个 Harness-Lite 智能体终端,
 
-## 🚀 [2026-06-2] cli的/mem0，长期记忆采用mem0开源框架进行[功能添加，但是还未测试]
+### 🚀 cli的/mem0，长期记忆采用mem0开源框架进行[功能添加，但是还未测试]
 - 每一次用户对话结束时使用mem0框架对回答内容进行处理和向量化，在每次user询问时现使用其在数据库中选择其中最相关的5条数据加载到system prompt中。
 - 默认是关闭状态，开启需要使用/命令，/mem0开启
 - 需要指定embedding模型的api
 - 采用chroma数据库其只能执行语义检索，如果需要关键词检索需要更换数据库
 
-## 🚀 [2026-06-4] 添加/sandbox，可以指定在那个沙箱中执行相关文件
+### 🚀 添加/sandbox，可以指定在那个沙箱中执行相关文件
 - 可以在指定的沙箱环境中创建、修改、执行相关操作
 - 大模型返回的指定路径不在指定的沙箱地址时，不执行相关tool
 - /sandbox 路径1 路径2 ...
@@ -63,7 +65,7 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 默认加载.env环境变量中的WORKSPACE_ROOT值，其可以传入多个地址，使用，进行分隔即可。
 - 最后这个功能会弃用，因为当前怕大模型返回的结果会损害本地文件，所以强制将其锁死在指定的路径下。
 
-# 🚀 [2026-06-10] 对loop循环进行优化
+### 🚀 对loop循环进行优化
 - 将整体接口合规化
 - 集中管理所有**异常恢复预算**，杜绝 `except Exception` 兜底带来的死循环
 - 引入 **L1 QueryEngine / L2 strategy** 双层职责切分
@@ -71,11 +73,11 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 整体修改在loop文件夹中。
 - 本次修改主要采用vibe coding方式
 
-# 🚀 [2026-06-11] 对tool工具进行修改
+### 🚀 对tool工具进行修改
 - 对tool工具进行修改，将每种工具都封装到一个文件夹中对外只保留接口
 - 目前实现了16中工具
 
-# 🚀 [2026-06-11] system prompt进行优化
+### 🚀 system prompt进行优化
 - 将之前一连串的系统提示词进行拆分
 - 将其结构分层、二段装配
 - 整体代码参考prompt文件夹
