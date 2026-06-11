@@ -286,7 +286,7 @@ class ReActStrategy(BaseStrategy):
         status_callback: Optional[Callable],
     ) -> List[Dict]:
         """【STAGE 1】上下文优化层：Token 高水位检测与动态收缩剪枝。"""
-        from harness_lite.tools.execution_ops import process_manager
+        from harness_lite.tools.bash_terminal import process_manager
         active_shell = process_manager.get_shell(session_id)
         current_terminal_cwd = active_shell.last_known_cwd if active_shell else "/"
         return await self.context_manager.compress_if_overflow(
@@ -309,7 +309,7 @@ class ReActStrategy(BaseStrategy):
         与 stage_1 的区别：不检查阈值，强制压缩。
         一期实现：直接降低阈值再调一次 compress_if_overflow（保证一定触发）。
         """
-        from harness_lite.tools.execution_ops import process_manager
+        from harness_lite.tools.bash_terminal import process_manager
         active_shell = process_manager.get_shell(session_id)
         current_terminal_cwd = active_shell.last_known_cwd if active_shell else "/"
 

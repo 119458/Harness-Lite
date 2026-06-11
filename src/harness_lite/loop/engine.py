@@ -19,7 +19,7 @@ from harness_lite.security.manager import security_manager
 from harness_lite.config.loader import get_llm_config
 
 # 物理执行层的会话上下文变量，打通全链路 Session 追踪
-from harness_lite.tools.execution_ops import current_session_id
+from harness_lite.tools.bash_terminal import current_session_id
 
 # 阶段 A 引入的消息类型（暂作中间表示，B1 不改外部签名）
 from harness_lite.loop.messages import StreamEvent

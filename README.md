@@ -71,6 +71,10 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 整体修改在loop文件夹中。
 - 本次修改主要采用vibe coding方式
 
+# 🚀 [2026-06-11] 对tool工具进行修改
+- 对tool工具进行修改，将每种工具都封装到一个文件夹中对外只保留接口
+- 目前实现了16中工具
+
 
 ## 架构
 

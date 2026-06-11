@@ -2,13 +2,14 @@ import os
 import pytest
 from pathlib import Path
 
-# 假设你的工具类保存在 src/harness_lite/tools/file_ops.py 中
-from harness_lite.tools.file_ops import (
+# 工具按工具一文件夹的结构分散在 tools/<tool_name>/<tool_name>.py 下，
+# 顶层 tools 包统一重新导出，保留这种 5 合 1 导入路径以保持测试稳定
+from harness_lite.tools import (
     ListDirectoryTool,
     ReadFileTool,
     CreateFileTool,
     EditFileTool,
-    GrepSearchTool
+    GrepSearchTool,
 )
 
 
@@ -135,3 +136,26 @@ def test_grep_search_tool(setup_tools, tmp_path):
     # 测试搜索不存在的字符串
     result_empty = tool.execute(query="NOT_EXIST", path=str(tmp_path))
     assert "No results found" in result_empty
+
+
+def test_edit_file_preserves_crlf(tmp_path):
+    """编辑 CRLF 文件后行尾不应被静默改为 LF"""
+    target = tmp_path / "crlf.txt"
+    target.write_bytes(b"line1\r\nline2\r\nline3\r\n")
+
+    tool = EditFileTool()
+    # 替换第 2 行
+    result = tool.execute(
+        file_path=str(target),
+        start_line=2,
+        end_line=2,
+        new_content="line2_modified",
+    )
+    assert "Success" in result, result
+
+    raw = target.read_bytes()
+    assert b"\r\n" in raw, f"CRLF 行尾被静默改为 LF：{raw!r}"
+    # 未被修改的行仍保留 CRLF
+    assert b"line1\r\n" in raw
+    assert b"line3\r\n" in raw
+    assert b"line2_modified" in raw

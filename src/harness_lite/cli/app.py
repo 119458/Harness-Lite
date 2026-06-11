@@ -282,29 +282,44 @@ class RichCLIOutputHandler:
             self.newlines_count = 0
             self.has_printed_prefix = False
 
-        # thinking 流：同一行不断累加（避免高频刷屏）
-        if label == "thinking" and self.status_lines and self.status_lines[-1][0] == "thinking":
-            last_label, last_body = self.status_lines[-1]
-            if len(last_body) > 85:
-                self.status_lines.append((label, body))
+        if label == "thinking":
+            # 仅在纯思考阶段使用 Live 动画合并输出
+            if self.status_lines and self.status_lines[-1][0] == "thinking":
+                last_label, last_body = self.status_lines[-1]
+                if len(last_body) > 85:
+                    self.status_lines.append((label, body))
+                else:
+                    self.status_lines[-1] = (last_label, last_body + body)
             else:
-                self.status_lines[-1] = (last_label, last_body + body)
+                self.status_lines.append((label, body))
+
+            while len(self.status_lines) > 5:
+                self.status_lines.pop(0)
+
+            if not self.thinking_live:
+                self.thinking_live = Live(
+                    self._get_thinking_renderable(),
+                    console=self.console,
+                    transient=True,
+                    refresh_per_second=30,
+                )
+                self.thinking_live.start()
+            else:
+                self.thinking_live.update(self._get_thinking_renderable())
+
         else:
+            # 遇到非 thinking 状态（如 tool, recover 等），必须立即停止后台重绘线程！
+            if self.thinking_live:
+                self.thinking_live.stop()
+                self.thinking_live = None
+
+            # 以纯静态的文本打印当前动作，不开启任何后台线程，从而释放标准输出的控制权
+            self.console.print(f"  [dim]·[/dim] [cyan]{label:<8}[/cyan] {body}")
+
+            # 仍记录到历史队列，确保后续如果又开始 thinking，这个上下文能被一起带入并正确缩进显示
             self.status_lines.append((label, body))
-
-        while len(self.status_lines) > 5:
-            self.status_lines.pop(0)
-
-        if not self.thinking_live:
-            self.thinking_live = Live(
-                self._get_thinking_renderable(),
-                console=self.console,
-                transient=True,
-                refresh_per_second=30,
-            )
-            self.thinking_live.start()
-        else:
-            self.thinking_live.update(self._get_thinking_renderable())
+            while len(self.status_lines) > 5:
+                self.status_lines.pop(0)
 
     def stream_callback(self, content: str):
         if not self.has_printed_prefix:

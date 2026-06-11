@@ -10,6 +10,24 @@ from datetime import datetime
 from openai import OpenAI
 
 from harness_lite.config.loader import get_llm_config
+from .whitelist import Whitelist, TOOL_QUOTA
+
+
+# Layer 2 触发集合：工具名 -> 判定是否需要进入 LLM 语义审查的回调
+# 仅对真正会产生外部副作用的动作启用 Layer 2，避免高频 action 浪费 token。
+LAYER2_TARGETS = {
+    "bash_terminal": lambda args: True,
+    "python_interpreter": lambda args: True,
+    "browser_automation": lambda args: args.get("action") == "navigate",
+}
+
+
+# task_scheduler 工具的合法动作集合
+_TASK_SCHED_ACTIONS = {"create", "list", "delete", "pause", "resume"}
+_TASK_SCHED_TYPES = {"cron", "interval", "once"}
+
+# browser_automation 工具的合法动作集合
+_BROWSER_ACTIONS = {"navigate", "click", "fill", "scroll", "snapshot", "wait_for", "screenshot", "close"}
 
 
 class PythonASTAuditor(ast.NodeVisitor):
@@ -87,6 +105,7 @@ class SecurityManager:
 
     def __init__(self):
         self._audit_log: list = []
+        self.whitelist = Whitelist()
         current_file = Path(__file__).resolve()
         project_root = current_file.parent.parent.parent.parent
         workspace_env = os.environ.get("WORKSPACE_ROOT")
@@ -209,6 +228,130 @@ class SecurityManager:
                     if re.search(pattern, cmd_arg):
                         return False, f"高危 Shell 指令拦截: 不允许执行该指令: '{cmd_arg}'。"
 
+        elif tool_name == "fuzzy_edit":
+            return self._validate_fuzzy_edit(input_data, session_id)
+
+        elif tool_name == "doc_fetch":
+            return self._validate_doc_fetch(input_data)
+
+        elif tool_name == "task_scheduler":
+            return self._validate_task_scheduler(input_data)
+
+        elif tool_name == "browser_automation":
+            return self._validate_browser_automation(input_data, session_id)
+
+        return True, ""
+
+    # ============================================================
+    # 新增 4 个工具的 Layer 1 静态校验（拆分为独立方法以控制嵌套深度）
+    # ============================================================
+
+    def _validate_fuzzy_edit(self, input_data: Dict[str, Any], session_id: str) -> Tuple[bool, str]:
+        """模糊编辑工具：复用路径沙箱 + new_text 体积上限。"""
+        path_arg = input_data.get("file_path")
+        if not path_arg:
+            return False, "fuzzy_edit 缺少必填参数 'file_path'。"
+
+        safe, result_msg = self._check_path_jail(path_arg, session_id)
+        if not safe:
+            return False, result_msg
+        input_data["file_path"] = result_msg
+
+        max_kb = TOOL_QUOTA["fuzzy_edit"]["max_replace_size_kb"]
+        max_bytes = max_kb * 1024
+        new_text = input_data.get("new_text", "") or ""
+        if len(new_text.encode("utf-8", errors="ignore")) > max_bytes:
+            return False, f"fuzzy_edit 的 new_text 体积超过上限 {max_kb}KB，请拆分多次编辑。"
+        return True, ""
+
+    def _validate_doc_fetch(self, input_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """文档抓取工具：URL 协议白名单 + 黑名单 + max_pages 范围。"""
+        url = (input_data.get("url") or "").strip()
+        if not url:
+            return False, "doc_fetch 缺少必填参数 'url'。"
+        if not (url.startswith("http://") or url.startswith("https://")):
+            return False, f"doc_fetch 仅支持 http/https URL，收到: '{url}'。"
+
+        blocked, reason = self.whitelist.is_url_blocked(url)
+        if blocked:
+            return False, f"doc_fetch URL 拦截: {reason}"
+
+        max_pages = input_data.get("max_pages", 1)
+        try:
+            max_pages_int = int(max_pages)
+        except (TypeError, ValueError):
+            return False, f"doc_fetch 的 max_pages 必须是整数，收到: {max_pages!r}。"
+        if not (1 <= max_pages_int <= 500):
+            return False, f"doc_fetch 的 max_pages 越界 (允许 [1,500])，收到: {max_pages_int}。"
+        return True, ""
+
+    def _validate_task_scheduler(self, input_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """定时任务工具：action 白名单 + create 动作的调度参数校验。"""
+        action = input_data.get("action")
+        if action not in _TASK_SCHED_ACTIONS:
+            return False, f"task_scheduler 的 action 非法 '{action}'，允许: {sorted(_TASK_SCHED_ACTIONS)}。"
+
+        if action != "create":
+            return True, ""
+
+        schedule_type = input_data.get("schedule_type")
+        if schedule_type not in _TASK_SCHED_TYPES:
+            return False, f"task_scheduler.create 的 schedule_type 非法 '{schedule_type}'，允许: {sorted(_TASK_SCHED_TYPES)}。"
+
+        schedule_value = input_data.get("schedule_value")
+        if schedule_type == "interval":
+            return self._validate_interval_value(schedule_value)
+        if schedule_type == "cron":
+            return self._validate_cron_value(schedule_value)
+        return True, ""
+
+    def _validate_interval_value(self, schedule_value: Any) -> Tuple[bool, str]:
+        """interval 模式：必须为整数秒，且 >= 最小间隔。"""
+        min_seconds = TOOL_QUOTA["task_scheduler"]["min_interval_seconds"]
+        try:
+            seconds = int(schedule_value)
+        except (TypeError, ValueError):
+            return False, f"task_scheduler.interval 的 schedule_value 必须是整数秒数，收到: {schedule_value!r}。"
+        if seconds < min_seconds:
+            return False, f"task_scheduler.interval 不允许小于 {min_seconds} 秒的频率（防止任务风暴），收到: {seconds}。"
+        return True, ""
+
+    def _validate_cron_value(self, schedule_value: Any) -> Tuple[bool, str]:
+        """cron 模式：能 import croniter 时校验语法，缺包静默放过。"""
+        if not isinstance(schedule_value, str) or not schedule_value.strip():
+            return False, "task_scheduler.cron 的 schedule_value 必须是非空字符串。"
+        try:
+            from croniter import croniter  # noqa: WPS433
+        except ImportError:
+            return True, ""  # 缺依赖时不阻塞，让工具自身报错
+        if not croniter.is_valid(schedule_value):
+            return False, f"task_scheduler.cron 表达式不合法: '{schedule_value}'。"
+        return True, ""
+
+    def _validate_browser_automation(self, input_data: Dict[str, Any], session_id: str) -> Tuple[bool, str]:
+        """浏览器工具：action 白名单 + navigate URL 拦截 + screenshot 路径沙箱化。"""
+        action = input_data.get("action")
+        if action not in _BROWSER_ACTIONS:
+            return False, f"browser_automation 的 action 非法 '{action}'，允许: {sorted(_BROWSER_ACTIONS)}。"
+
+        if action == "navigate":
+            url = (input_data.get("url") or "").strip()
+            if not url:
+                return False, "browser_automation.navigate 需要提供 'url'。"
+            if not (url.startswith("http://") or url.startswith("https://")):
+                return False, f"browser_automation 仅支持 http/https URL，收到: '{url}'。"
+            blocked, reason = self.whitelist.is_url_blocked(url)
+            if blocked:
+                return False, f"browser_automation URL 拦截: {reason}"
+            return True, ""
+
+        if action == "screenshot":
+            # 仅当显式指定输出路径时校验；默认走工具内部沙箱目录。
+            path_arg = input_data.get("path") or input_data.get("file_path")
+            if path_arg:
+                safe, result_msg = self._check_path_jail(path_arg, session_id)
+                if not safe:
+                    return False, result_msg
         return True, ""
 
     def _llm_semantic_audit(self, tool_name: str, input_data: Dict[str, Any]) -> Tuple[int, str]:
@@ -272,22 +415,37 @@ class SecurityManager:
             return 75, f"语义审计层运行异常 ({str(e)})，触发默认中度风险等级保护，转至人工终审。"
 
     def _human_audit(self, tool_name: str, input_data: Dict[str, Any], reason: str) -> bool:
-        print("\n" + "🚨" * 30)
-        print("⚠️  [安全托管] 物理工具调用已被捕获，系统判定其处于【灰色风险地带】")
-        print(f"👉 动作触点工具: \033[1;33m{tool_name}\033[0m")
-        print(f"🧠 审计层推导原因: {reason}")
-        print("📊 待执行的工具参数详情:")
-        print(json.dumps(input_data, ensure_ascii=False, indent=4))
-        print("🚨" * 30)
-
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.text import Text
+        from prompt_toolkit import prompt
+        from prompt_toolkit.formatted_text import HTML
+        console = Console()
+        warning_text = Text()
+        warning_text.append(f"👉 动作触点工具: {tool_name}\n", style="bold yellow")
+        warning_text.append(f"🧠 审计层推导原因: {reason}\n\n", style="white")
+        warning_text.append("📊 待执行的工具参数详情:\n", style="white")
+        warning_text.append(json.dumps(input_data, ensure_ascii=False, indent=4), style="dim")
+        console.print(Panel(
+            warning_text,
+            title="[bold red]🚨 [安全托管] 物理工具调用处于【灰色风险地带】",
+            border_style="red",
+            padding=(1, 2)
+        ))
         while True:
-            choice = input("❓ 是否允许 Agent 执行此项操作？[Y] 允许放行 / [N] 阻断并通知 Agent: ").strip().lower()
-            if choice == 'y':
-                return True
-            elif choice == 'n':
+            try:
+                choice = prompt(
+                    HTML("<ansicyan>❓ 是否允许 Agent 执行此项操作？[Y] 允许放行 / [N] 阻断并通知 Agent: </ansicyan>")
+                ).strip().lower()
+                if choice == "y":
+                    return True
+                elif choice == "n":
+                    return False
+                else:
+                    console.print("[red]错误输入！请明确输入 Y 或 N。[/red]")
+            except (EOFError, KeyboardInterrupt):
+                console.print("\n[red]操作被用户中止，已默认阻断并通知 Agent。[/red]")
                 return False
-            else:
-                print("错误输入！请明确输入 Y 或 N。")
 
     def audit_log(self, action: str, tool_name: str, user_id: str, result: str) -> None:
         self._audit_log.append({
@@ -306,15 +464,19 @@ class SecurityManager:
         l1_safe, l1_msg = self._validate_layer1_static(tool_name, input_data, session_id=user_id)
         if not l1_safe:
             self.audit_log("deny", tool_name, user_id, f"Layer 1 Blocked: {l1_msg}")
-            return False, f"静态防御拦截: {l1_msg}。"
+            return False, f"[Security Blocked] 静态防御拦截: {l1_msg}。"
 
-        # ====== 2. LAYER 2: 语义意图审查 ======
-        if tool_name in ["bash_terminal", "python_interpreter"]:
+        # ====== 2. LAYER 2: 语义意图审查（动作粒度可配置） ======
+        should_layer2 = (
+            tool_name in LAYER2_TARGETS
+            and LAYER2_TARGETS[tool_name](input_data)
+        )
+        if should_layer2:
             score, reason = self._llm_semantic_audit(tool_name, input_data)
 
             if score < 60:
                 self.audit_log("deny", tool_name, user_id, f"Layer 2 Blocked (Score {score}): {reason}")
-                return False, f"语义审计层拦截 (风险评分: {score}): {reason}。"
+                return False, f"[Security Blocked] 语义审计层拦截 (风险评分: {score}): {reason}。"
 
             # 3. 进入灰色风险，托管至 LAYER 3 人工终审
             if 60 <= score < 90:
@@ -347,7 +509,7 @@ class SecurityManager:
                     except Exception as e:
                         print(f"[Memory System Warning] 触发纠错记忆动态提炼时发生异常: {str(e)}")
 
-                    return False, f"[User Interrupted] 人类用户在最终审查层强制拒绝了执行。原因: 该操作具有潜在系统环境隐患。请更换一种更加温和、不触及敏感状态的全新策略来实现目标。"
+                    return False, f"[Security Blocked] [User Interrupted] 人类用户在最终审查层强制拒绝了执行。原因: 该操作具有潜在系统环境隐患。请更换一种更加温和、不触及敏感状态的全新策略来实现目标。"
 
         self.audit_log("allow", tool_name, user_id, "passed all layers")
         return True, None

@@ -1,6 +1,10 @@
+"""SKILL.md 正文读取工具"""
+
 from typing import Dict, Any
+
 from harness_lite.tools.base import BaseTool
 from harness_lite.registry.skill_registry import skill_registry
+
 
 class ReadSkillTool(BaseTool):
     """
