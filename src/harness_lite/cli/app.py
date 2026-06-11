@@ -187,6 +187,8 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
     elif cmd == "/clear":
         try:
             engine.memory.clear_context(session_id)
+            from harness_lite.prompt.section_cache import get_default_cache
+            get_default_cache().clear("user_clear_command")
             console.print(f"[cyan]✓[/cyan] context cleared [dim](session={session_id})[/dim]")
         except Exception as e:
             console.print(f"[red]error:[/red] clear failed: {e}")

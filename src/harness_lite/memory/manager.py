@@ -7,7 +7,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Callable
 from datetime import datetime
 import threading
 
@@ -19,6 +19,34 @@ from .store import MemoryStore
 from harness_lite.config.loader import get_llm_config
 
 logger = logging.getLogger("harness_lite.memory")
+
+
+# 模块级失效回调列表：由 PromptBuilder 的 section 缓存等外部组件注册，
+# 在 clear_context 后被依次调用以同步丢弃旧的渲染缓存
+_invalidation_callbacks: List[Callable[[str], None]] = []
+_invalidation_lock = threading.Lock()
+
+
+def register_invalidation_callback(callback: Callable[[str], None]) -> None:
+    """注册一个会在记忆失效（如 clear_context）时被回调的钩子。
+
+    参数：
+        callback: 接受一个 reason 字符串的可调用对象，返回值忽略。
+    """
+    with _invalidation_lock:
+        if callback not in _invalidation_callbacks:
+            _invalidation_callbacks.append(callback)
+
+
+def _fire_invalidation(reason: str) -> None:
+    """触发全部注册的失效回调，单个回调失败仅记日志。"""
+    with _invalidation_lock:
+        callbacks = list(_invalidation_callbacks)
+    for cb in callbacks:
+        try:
+            cb(reason)
+        except Exception as exc:
+            logger.warning("失效回调执行异常（reason=%s）: %s", reason, exc)
 
 
 class MemoryManager:
@@ -178,6 +206,7 @@ class MemoryManager:
             if messages and messages[0].get("role") == "system":
                 self.save_context(session_id, [messages[0]])
                 logger.info(f"[Session-{session_id}] 成功执行内核级热重置，安全保留 System 设定。")
+                _fire_invalidation("clear_context")
                 return
         except Exception as e:
             logger.warning(f"[Session-{session_id}] 解析上下文尝试热重置时发生异常: {str(e)}")
@@ -188,6 +217,12 @@ class MemoryManager:
             import shutil
             shutil.rmtree(session_dir)
         logger.info(f"[Session-{session_id}] 上下文为空或不合法，已完成基础物理清空。")
+        _fire_invalidation("clear_context")
+
+    @staticmethod
+    def register_invalidation_callback(callback: Callable[[str], None]) -> None:
+        """实例侧的转发入口，方便在持有 MemoryManager 时直接挂回调。"""
+        register_invalidation_callback(callback)
 
     def list_sessions(self) -> List[str]:
         return [f.stem for f in self._store._store_dir.iterdir() if f.suffix == ".json"]

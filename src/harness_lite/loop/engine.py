@@ -8,6 +8,10 @@ from random import choice
 from typing import Dict, Any, List, Optional, Callable, AsyncGenerator
 import json
 import asyncio
+import os
+import platform as _platform_mod
+from datetime import datetime
+from pathlib import Path
 
 # 引入官方 OpenAI SDK 核心库
 from openai import AsyncOpenAI
@@ -24,27 +28,9 @@ from harness_lite.tools.bash_terminal import current_session_id
 # 阶段 A 引入的消息类型（暂作中间表示，B1 不改外部签名）
 from harness_lite.loop.messages import StreamEvent
 
-SYSTEM_PROMPT = """你是一个智能助手，可以使用工具来完成复杂的系统任务。
-
-【环境与沙箱状态】
-当前系统为你安全挂载并挂牌授权了多个物理沙箱工作区(Workspace Roots)，列表如下：
-{workspace_roots}
-注意：你对文件的创建(create_file)、编辑(edit_file)、读取(read_file)及终端操作(bash_terminal)等所有原子工具的输入路径，都必须绝对约束在上述挂载的工作区路径范围内。严禁探出边界去访问系统级的敏感文件（如 /etc, ~/.ssh）。
-
-【可用物理工具】
-{tools_schema}
-当使用 edit_file 时，请必须先使用 read_file 查阅目标文件的具体行号，然后精确提供 start_line 和 end_line 进行局部替换。
-
-【可用业务技能 / SOP 指南手册】
-以下是你目前掌握的特定领域专业规范目录。如果你需要处理相关任务，请先调用 `read_skill` 工具查阅对应的详细规范手册：
-{skills_list}
-
-当你需要完成一个任务时：
-1. 先检查该任务是否涉及上述业务技能。如果涉及，请先调用 `read_skill` 工具学习其详细 SOP 规范。
-2. 明确你要操作的文件路径，确保它在工作区沙箱内。
-3. 如果可以直接回答，直接回复；如果需要调用外部物理工具，使用 tool_calls 格式。
-4. 完成工具调用后，根据结果回复用户。
-"""
+# 分层 system prompt 组装器
+from harness_lite.prompt import PromptBuilder, PromptContext
+from harness_lite.prompt.section_cache import get_default_cache
 
 
 def sanitize_surrogates(data: Any) -> Any:
@@ -82,6 +68,19 @@ class AsyncLoopEngine:
         self.security = security_manager
         self.registry = tool_registry
 
+        # 进程级 section 缓存：静态前缀几乎永远命中，动态后缀按 dep_sig 自然失效
+        self.cache = get_default_cache()
+
+        # 一次性注册：当 MemoryManager.clear_context 被触发时同步清缓存，
+        # 避免新会话仍然读到旧的 memory_recall 段
+        try:
+            self.memory.register_invalidation_callback(
+                lambda reason: self.cache.clear(reason)
+            )
+        except AttributeError:
+            # MemoryManager 未升级时降级为 no-op，不阻塞引擎启动
+            pass
+
     async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None,
                   status_callback: Callable[[str], None] = None) -> str:
         # 协程入口层：强制绑定当前异步上下文的 session_id 状态
@@ -100,37 +99,85 @@ class AsyncLoopEngine:
 
     def build_initial_messages(self, task: str, session_id: str = "default") -> List[Dict[str, str]]:
         """
-        构建初始系统消息（支持 Session 级别物理沙箱路径的自适应渲染与 Claude Code 级分层记忆注入）
+        构建初始系统消息：通过 PromptBuilder 分层组装，再追加用户 task。
+
+        所有运行时上下文（沙箱根、工具 schema、技能、长效记忆、环境元数据等）
+        在此处一次性收齐，传入 PromptContext 后由各 section 自行渲染。
         """
-        tools_schema = self._get_all_tools_schema()
-        all_skills = skill_registry.list_all()
-        if all_skills:
-            lines = []
-            for s in all_skills:
-                s_name = s.name if hasattr(s, 'name') else s.get('name', '')
-                s_desc = s.description if hasattr(s, 'description') else s.get('description', '')
-                lines.append(f"- 技能名称: `{s_name}` | 简介: {s_desc}")
-            skills_list_str = "\n".join(lines)
-        else:
-            skills_list_str = "当前未加载任何特定的业务技能指南。"
-
-        # 提取并渲染多工作区集群字符串给大模型
-        sorted_roots = sorted(self.security.active_sandbox_roots)
-        roots_str = "\n".join([f"  - `{r}`" for r in sorted_roots])
-
-        system_content = SYSTEM_PROMPT.format(
-            workspace_roots=roots_str,
-            tools_schema=json.dumps(tools_schema, ensure_ascii=False),
-            skills_list=skills_list_str
-        )
-
-        prior_memories_md = self.memory.load_markdown_memories_as_text(session_id, current_task=task)
-        full_system_prompt = f"{system_content}\n\n【你先前通过学习或被人类纠错沉淀下来的核心长效行为备忘录】\n{prior_memories_md}"
+        ctx = self._build_prompt_context(task, session_id)
+        system_text = PromptBuilder(ctx, self.cache).build()
 
         return [
-            {"role": "system", "content": full_system_prompt},
-            {"role": "user", "content": task}
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": task},
         ]
+
+    def _build_prompt_context(self, task: str, session_id: str) -> PromptContext:
+        """收集 PromptContext 所需的全部字段（IO/反射集中在此，section 保持纯函数）。"""
+        tools_schema = self._get_all_tools_schema()
+        tools_schema_json = json.dumps(tools_schema, ensure_ascii=False)
+        enabled_tools = tuple(sorted(t.get("function", {}).get("name", "") for t in tools_schema))
+
+        skills_list = self._collect_skills_list()
+        sandbox_roots = tuple(sorted(str(r) for r in self.security.active_sandbox_roots))
+        memory_text = self.memory.load_markdown_memories_as_text(session_id, current_task=task)
+
+        try:
+            config = get_llm_config()
+        except Exception:
+            config = {}
+
+        return PromptContext(
+            task=task,
+            session_id=session_id,
+            model_name=config.get("model_name", "") if isinstance(config, dict) else "",
+            sandbox_roots=sandbox_roots,
+            enabled_tools=enabled_tools,
+            tools_schema_json=tools_schema_json,
+            skills_list=skills_list,
+            memory_text=memory_text,
+            mem0_enabled=bool(getattr(self.memory, "use_mem0", False)),
+            cwd=self._safe_cwd(),
+            is_git=self._detect_git(),
+            platform=_platform_mod.system(),
+            shell=os.environ.get("SHELL", ""),
+            os_version=_platform_mod.platform(),
+            current_date=datetime.now().strftime("%Y/%m/%d"),
+            thinking_mode=bool(config.get("thinking_mode")) if isinstance(config, dict) else False,
+        )
+
+    @staticmethod
+    def _collect_skills_list() -> tuple:
+        """把 skill_registry 中的 Skill 实例归一化成 dict 列表。"""
+        items = []
+        for skill in skill_registry.list_all():
+            name = getattr(skill, "name", "") if not isinstance(skill, dict) else skill.get("name", "")
+            desc = (
+                getattr(skill, "description", "")
+                if not isinstance(skill, dict)
+                else skill.get("description", "")
+            )
+            items.append({"name": name, "description": desc})
+        return tuple(items)
+
+    @staticmethod
+    def _safe_cwd() -> str:
+        try:
+            return os.getcwd()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _detect_git() -> bool:
+        try:
+            p = Path(os.getcwd())
+            while p != p.parent:
+                if (p / ".git").exists():
+                    return True
+                p = p.parent
+        except Exception:
+            return False
+        return False
 
     def build_hot_swapped_context(self, task: str, session_id: str = "default") -> List[Dict[str, Any]]:
         """

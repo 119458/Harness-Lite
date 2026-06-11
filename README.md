@@ -75,6 +75,12 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 对tool工具进行修改，将每种工具都封装到一个文件夹中对外只保留接口
 - 目前实现了16中工具
 
+# 🚀 [2026-06-11] system prompt进行优化
+- 将之前一连串的系统提示词进行拆分
+- 将其结构分层、二段装配
+- 整体代码参考prompt文件夹
+- 为后续的记忆系统和上下文系统压缩提供了有利支持
+
 
 ## 架构
 
@@ -117,6 +123,8 @@ harness-lite "你的任务"
 pytest tests/ -v
 ```
 
-## 许可证
+## 参考项目
+[OpenHarness](https://github.com/HKUDS/OpenHarness)。
+[CowAgent](https://github.com/zhayujie/CowAgent)。
 
-MIT License — 原始项目见 [OpenHarness](https://github.com/example/open-harness)。
+
