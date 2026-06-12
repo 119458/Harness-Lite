@@ -16,7 +16,7 @@ from openai import OpenAI
 # 注意：mem0 为可选依赖。仅在 toggle_mem0() / _init_mem0() 中方引入。
 
 from .store import MemoryStore
-from harness_lite.config.loader import get_llm_config
+from harness_lite.config.loader import get_main_config
 
 logger = logging.getLogger("harness_lite.memory")
 
@@ -101,7 +101,8 @@ class MemoryManager:
                 "[Mem0 未安装] 请先 `pip install mem0ai` 并配置 embedding 模型 API 后再启用 /mem0。"
             ) from e
 
-        config = get_llm_config()
+        # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+        config = get_main_config()
         current_model = config.get("model_name", "gpt-3.5-turbo")
 
         # 模型降级路由
@@ -282,7 +283,8 @@ class MemoryManager:
         else:
             # 关闭状态：完全恢复您原来基于 OpenAI API 提炼写入 Markdown 的逻辑
             try:
-                config = get_llm_config()
+                # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+                config = get_main_config()
                 if not config or not config.get("api_key"):
                     logger.warning("未配置大模型凭证，跳过长期记忆自主蒸馏。")
                     return

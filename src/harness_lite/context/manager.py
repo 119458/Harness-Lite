@@ -12,7 +12,7 @@ try:
 except ModuleNotFoundError:
     tiktoken = None
 
-from harness_lite.config.loader import get_llm_config
+from harness_lite.config.loader import get_main_config
 
 logger = logging.getLogger("harness_lite.context")
 
@@ -119,7 +119,8 @@ class DynamicContextManager:
             return messages
 
         try:
-            config = get_llm_config()
+            # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+            config = get_main_config()
             raw_history_text = ""
             for m in compressible_chunk:
                 if m.get("reasoning_content"):
@@ -141,7 +142,8 @@ class DynamicContextManager:
             client = AsyncOpenAI(
                 api_key=config["api_key"],
                 base_url=config["base_url"],
-                max_retries=2
+                max_retries=2,
+                http_client=httpx.AsyncClient(trust_env=False)
             )
             extra_body = {
                 "thinking": {"type": "disabled"},

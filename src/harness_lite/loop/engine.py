@@ -15,12 +15,13 @@ from pathlib import Path
 
 # 引入官方 OpenAI SDK 核心库
 from openai import AsyncOpenAI
+import httpx
 
 from harness_lite.memory.manager import MemoryManager
 from harness_lite.registry import tool_registry
 from harness_lite.registry import skill_registry
 from harness_lite.security.manager import security_manager
-from harness_lite.config.loader import get_llm_config
+from harness_lite.config.loader import get_main_config
 
 # 物理执行层的会话上下文变量，打通全链路 Session 追踪
 from harness_lite.tools.bash_terminal import current_session_id
@@ -123,7 +124,8 @@ class AsyncLoopEngine:
         memory_text = self.memory.load_markdown_memories_as_text(session_id, current_task=task)
 
         try:
-            config = get_llm_config()
+            # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+            config = get_main_config()
         except Exception:
             config = {}
 
@@ -207,7 +209,8 @@ class AsyncLoopEngine:
         """
         利用 OpenAI SDK 异步安全请求模型，内置 3 次自动指数退避重试管线
         """
-        config = get_llm_config()
+        # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+        config = get_main_config()
         tools = self._get_all_tools_schema() or None
 
         processed_messages = []
@@ -223,7 +226,8 @@ class AsyncLoopEngine:
         client = AsyncOpenAI(
             api_key=config["api_key"],
             base_url=config["base_url"],
-            max_retries=3
+            max_retries=3,
+            http_client=httpx.AsyncClient(trust_env=False)
         )
 
         try:

@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 
-from harness_lite.config.loader import get_llm_config
+from harness_lite.config.loader import get_main_config
 from harness_lite.loop.messages import (
     AssistantMessage,
     AttachmentMessage,
@@ -37,7 +37,8 @@ from harness_lite.loop.recovery import (
 
 logger = logging.getLogger("harness_lite.strategy")
 
-config = get_llm_config()
+# TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+config = get_main_config()
 
 
 class BaseStrategy(ABC):

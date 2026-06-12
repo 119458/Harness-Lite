@@ -18,7 +18,7 @@ from rich.live import Live
 from rich.text import Text
 from rich.panel import Panel
 
-from harness_lite.config import get_llm_config
+from harness_lite.config import get_main_config, get_medium_config, get_small_config
 from harness_lite.loop import AsyncLoopEngine
 from harness_lite.memory import MemoryManager
 
@@ -140,14 +140,30 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
 
     elif cmd == "/model":
         try:
-            config = get_llm_config()
-            thinking = "enabled" if config.get('thinking_mode') else "disabled"
+            main_cfg = get_main_config()
+            medium_cfg = get_medium_config()
+            small_cfg = get_small_config()
+            thinking = "on" if main_cfg.get('thinking_mode') else "off"
+
+            def _is_fallback(tier_cfg: dict) -> bool:
+                return (
+                    tier_cfg.get('model_name') == main_cfg.get('model_name')
+                    and tier_cfg.get('base_url') == main_cfg.get('base_url')
+                    and tier_cfg.get('api_key') == main_cfg.get('api_key')
+                )
+
+            def _tier_label(tier_cfg: dict) -> str:
+                if _is_fallback(tier_cfg):
+                    return "未配置 → 已降级到主模型"
+                tier_thinking = "on" if tier_cfg.get('thinking_mode') else "off"
+                return f"{tier_cfg.get('model_name')} @ {tier_cfg.get('base_url')} (thinking: {tier_thinking})"
+
             content = (
-                f"[cyan]model[/cyan]    : {config.get('model_name')}\n"
-                f"[cyan]base_url[/cyan] : {config.get('base_url')}\n"
-                f"[cyan]thinking[/cyan] : {thinking}"
+                f"[cyan]主模型[/cyan]  : {main_cfg.get('model_name')} @ {main_cfg.get('base_url')} (thinking: {thinking})\n"
+                f"[cyan]中模型[/cyan]  : {_tier_label(medium_cfg)}\n"
+                f"[cyan]小模型[/cyan]  : {_tier_label(small_cfg)}"
             )
-            console.print(_panel(content, "Model"))
+            console.print(_panel(content, "Model (Tiered)"))
         except Exception as e:
             console.print(f"[red]error:[/red] failed to load model config: {e}")
 
@@ -274,6 +290,14 @@ class RichCLIOutputHandler:
 
         label, body = _strip_status_prefix(clean_line)
 
+        # ========================================================
+        # 【核心修复】如果不是静态思考状态，在做任何 stdout 擦除前，
+        # 必须先立刻停止后台 Live 重绘，释放标准输出流！
+        # ========================================================
+        if label != "thinking" and self.thinking_live:
+            self.thinking_live.stop()
+            self.thinking_live = None
+
         # tool 启动是真正的工具开始信号：擦除已打印的中间文本
         if label == "tool" and self.printed_text:
             sys.stdout.write("\r\033[K")
@@ -310,12 +334,7 @@ class RichCLIOutputHandler:
                 self.thinking_live.update(self._get_thinking_renderable())
 
         else:
-            # 遇到非 thinking 状态（如 tool, recover 等），必须立即停止后台重绘线程！
-            if self.thinking_live:
-                self.thinking_live.stop()
-                self.thinking_live = None
-
-            # 以纯静态的文本打印当前动作，不开启任何后台线程，从而释放标准输出的控制权
+            # 由于上方已经前置处理过 thinking_live.stop()，这里直接安全打印即可
             self.console.print(f"  [dim]·[/dim] [cyan]{label:<8}[/cyan] {body}")
 
             # 仍记录到历史队列，确保后续如果又开始 thinking，这个上下文能被一起带入并正确缩进显示
@@ -387,7 +406,8 @@ def main(
 ):
     """Harness-Lite: 多智能体编排 CLI"""
     try:
-        get_llm_config()
+        # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+        get_main_config()
     except ValueError as e:
         typer.echo(f"配置错误: {e}", err=True)
         raise typer.Exit(code=1)

@@ -71,7 +71,7 @@ class SectionCache:
 
 # 进程级单例：engine 通过 get_default_cache() 取用
 _default_cache: Optional[SectionCache] = None
-_default_cache_lock = threading.Lock()
+_default_cache_lock = threading.RLock()
 
 
 def get_default_cache() -> SectionCache:

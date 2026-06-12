@@ -22,7 +22,9 @@ def compute(ctx: PromptContext) -> Optional[str]:
 
 
 def dep_sig(ctx: PromptContext) -> str:
-    # 内容当前无运行时变量；保留独立版本号以备后续扩展
+    # 当前内容为纯静态文本，dep_sig 因此恒定。
+    # 注意：若未来给 compute 增加任何 ctx 依赖字段（如 sandbox_roots、session_id），
+    # 必须把对应字段拼入此处签名，否则缓存会读到脏数据。
     return "session_guidance:v1"
 
 

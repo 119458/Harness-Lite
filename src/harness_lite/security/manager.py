@@ -9,7 +9,7 @@ from datetime import datetime
 # 【核心替换点】引入官方 OpenAI 同步客户端
 from openai import OpenAI
 
-from harness_lite.config.loader import get_llm_config
+from harness_lite.config.loader import get_main_config
 from .whitelist import Whitelist, TOOL_QUOTA
 
 
@@ -361,7 +361,8 @@ class SecurityManager:
         ============================================================
         """
         try:
-            config = get_llm_config()
+            # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
+            config = get_main_config()
             if not config or not config.get("api_key"):
                 return 75, "系统未配置专属语义审计模型配置，安全策略平滑降级转向人工终审。"
 

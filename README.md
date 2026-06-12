@@ -83,6 +83,11 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 整体代码参考prompt文件夹
 - 为后续的记忆系统和上下文系统压缩提供了有利支持
 
+### 🚀 对模型进行划分
+- 之前只有一个模型，现在添加了主模型，中等模型和小模型
+- 后续可根据不同场景切换不同的模型，当前还没有添加切换模型的操作
+- /model只能展示当前有哪些模型
+
 
 ## 架构
 
@@ -107,6 +112,8 @@ pip install -e .
 ```
 
 ## 使用
+
+将.env.example 修改为.env文件并添加上base_url,api_key,model_name,think_mode
 
 ```bash
 # 交互模式（自动生成会话）
