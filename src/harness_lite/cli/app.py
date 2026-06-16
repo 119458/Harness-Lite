@@ -156,10 +156,12 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
                 if _is_fallback(tier_cfg):
                     return "未配置 → 已降级到主模型"
                 tier_thinking = "on" if tier_cfg.get('thinking_mode') else "off"
-                return f"{tier_cfg.get('model_name')} @ {tier_cfg.get('base_url')} (thinking: {tier_thinking})"
+                ctx = tier_cfg.get('max_context_tokens', 'unknown')
+                return f"{tier_cfg.get('model_name')} @ {tier_cfg.get('base_url')} (thinking: {tier_thinking}, ctx: {ctx})"
 
+            main_ctx = main_cfg.get('max_context_tokens', 'unknown')
             content = (
-                f"[cyan]主模型[/cyan]  : {main_cfg.get('model_name')} @ {main_cfg.get('base_url')} (thinking: {thinking})\n"
+                f"[cyan]主模型[/cyan]  : {main_cfg.get('model_name')} @ {main_cfg.get('base_url')} (thinking: {thinking}, ctx: {main_ctx})\n"
                 f"[cyan]中模型[/cyan]  : {_tier_label(medium_cfg)}\n"
                 f"[cyan]小模型[/cyan]  : {_tier_label(small_cfg)}"
             )

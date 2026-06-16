@@ -61,7 +61,11 @@ class AsyncLoopEngine:
         # ========================================================
         if strategy is None:
             from harness_lite.loop.strategy import ReActStrategy
-            self.strategy = ReActStrategy()
+            config = get_main_config()
+            self.strategy = ReActStrategy(
+                max_tokens_threshold=config.get("max_context_tokens", 128_000),
+                model_name=config.get("model_name", "gpt-4-mini"),
+            )
         else:
             self.strategy = strategy
 
@@ -80,6 +84,15 @@ class AsyncLoopEngine:
             )
         except AttributeError:
             # MemoryManager 未升级时降级为 no-op，不阻塞引擎启动
+            pass
+
+        # 注册 sidecar 失效回调：MemoryManager.clear_context 时同步清空 pipeline 状态
+        try:
+            pipeline = self.strategy.context_manager.pipeline
+            self.memory.register_invalidation_callback(
+                lambda reason: pipeline.reset_session(reason)
+            )
+        except AttributeError:
             pass
 
     async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None,
@@ -222,6 +235,17 @@ class AsyncLoopEngine:
 
         # 数据在灌入 SDK 前，清洗掉残余的非标准 Surrogate 乱码
         safe_messages = sanitize_surrogates(processed_messages)
+
+        # L4 上下文投影：在发往 SDK 前剥离内部字段、合并连续 system 锚点
+        try:
+            pipeline = self.strategy.context_manager.pipeline
+            safe_messages = pipeline.project_for_llm(
+                safe_messages,
+                thinking_mode=bool(config.get("thinking_mode", False)),
+            )
+        except AttributeError:
+            # strategy 不是 ReActStrategy（如 mock 或单测）时降级跳过
+            pass
 
         client = AsyncOpenAI(
             api_key=config["api_key"],

@@ -15,6 +15,8 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
+from harness_lite.config.model_registry import resolve_context_window
+
 logger = logging.getLogger("harness_lite.config")
 
 # 三组配置独立缓存，reload_config 必须同时清空
@@ -50,6 +52,7 @@ def _load_env() -> None:
     main_base_url = os.getenv("LLM_MAIN_BASE_URL")
     main_model_name = os.getenv("LLM_MAIN_MODEL_NAME")
     thinking_mode = os.getenv("LLM_MAIN_THINKING_MODE", "false").lower() == "true"
+    main_max_tokens_raw = os.getenv("LLM_MAIN_MAX_TOKENS")
 
     missing = []
     if not main_api_key:
@@ -69,6 +72,9 @@ def _load_env() -> None:
         "base_url": main_base_url,
         "model_name": main_model_name,
         "thinking_mode": thinking_mode,
+        "max_context_tokens": _resolve_max_context_tokens(
+            "main", main_model_name, main_max_tokens_raw,
+        ),
     }
 
     # ---- 2. 解析中模型（缺失则降级到主模型） ----
@@ -79,6 +85,7 @@ def _load_env() -> None:
         model_name=os.getenv("LLM_MEDIUM_MODEL_NAME"),
         tier_thinking_raw=os.getenv("LLM_MEDIUM_THINKING_MODE"),
         main_thinking_mode=thinking_mode,
+        max_tokens_override=os.getenv("LLM_MEDIUM_MAX_TOKENS"),
     )
 
     # ---- 3. 解析小模型（缺失则降级到主模型） ----
@@ -89,7 +96,43 @@ def _load_env() -> None:
         model_name=os.getenv("LLM_SMALL_MODEL_NAME"),
         tier_thinking_raw=os.getenv("LLM_SMALL_THINKING_MODE"),
         main_thinking_mode=thinking_mode,
+        max_tokens_override=os.getenv("LLM_SMALL_MAX_TOKENS"),
     )
+
+
+def _resolve_max_context_tokens(
+    tier_label: str, model_name: str, env_override: Optional[str],
+) -> int:
+    """解析单层 max_context_tokens：env 覆盖 → 注册表查找 → 默认值。
+
+    env 覆盖优先级最高；非数字或 ≤0 时写 warning 并回退到注册表。
+    超过 MAX_REASONABLE_TOKENS（2M）时打 warning 但仍放行（用户可能确有需要）。
+    """
+    # Gemini 1.5 Pro 的 2M 是已知最大；超过这个值大概率是配置失误（多打 0）
+    MAX_REASONABLE_TOKENS = 2_097_152
+    env_var_name = f"LLM_{tier_label.upper()}_MAX_TOKENS"
+    if env_override and env_override.strip():
+        raw = env_override.strip()
+        try:
+            value = int(raw)
+            if value > 0:
+                if value > MAX_REASONABLE_TOKENS:
+                    logger.warning(
+                        "%s=%d 超过已知最大上下文窗口 %d，可能配置失误（多打 0?）；"
+                        "仍按用户指定值放行，若 LLM 调用失败请检查此值",
+                        env_var_name, value, MAX_REASONABLE_TOKENS,
+                    )
+                return value
+            logger.warning(
+                "%s='%s' 必须为正整数，回退到注册表",
+                env_var_name, raw,
+            )
+        except ValueError:
+            logger.warning(
+                "%s='%s' 非法（无法解析为整数），回退到注册表",
+                env_var_name, raw,
+            )
+    return resolve_context_window(model_name)
 
 
 def _resolve_tier_config(
@@ -99,12 +142,17 @@ def _resolve_tier_config(
     model_name: Optional[str],
     tier_thinking_raw: Optional[str],
     main_thinking_mode: bool,
+    max_tokens_override: Optional[str] = None,
 ) -> Dict[str, any]:
     """解析单个非主模型层级；缺任一必填字段则降级到主模型。
 
     thinking_mode 规则：
     - 该层级显式设置 LLM_*_THINKING_MODE 时按其值（true/false）
     - 未设置则继承主模型的 thinking_mode
+
+    max_context_tokens 规则：
+    - 降级到主模型时由 _MAIN_CONFIG.copy() 自带，无需额外处理
+    - 独立配置时按 env 覆盖 → 注册表 → 默认值的顺序解析
     """
     if not api_key or not base_url or not model_name:
         logger.info(f"{tier_label} 模型未完整配置，降级到 main")
@@ -120,6 +168,9 @@ def _resolve_tier_config(
         "base_url": base_url,
         "model_name": model_name,
         "thinking_mode": tier_thinking_mode,
+        "max_context_tokens": _resolve_max_context_tokens(
+            tier_label, model_name, max_tokens_override,
+        ),
     }
 
 

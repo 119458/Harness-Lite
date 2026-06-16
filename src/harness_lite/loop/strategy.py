@@ -61,10 +61,19 @@ class ReActStrategy(BaseStrategy):
     - execute()        : str  ← 兼容旧调用栈（B2 QueryEngine 仍走这条）
     """
 
-    def __init__(self, max_steps: int = 15, max_tokens_threshold: int = 64000):
+    def __init__(
+        self,
+        max_steps: int = 15,
+        max_tokens_threshold: int = 128_000,
+        model_name: str = "gpt-4-mini",
+    ):
         from harness_lite.context.manager import DynamicContextManager
         self.max_steps = max_steps
-        self.context_manager = DynamicContextManager(max_allowed_tokens=max_tokens_threshold)
+        self.model_name = model_name
+        self.context_manager = DynamicContextManager(
+            max_allowed_tokens=max_tokens_threshold,
+            model_name=model_name,
+        )
 
     # ================================================================
     # 1. 兼容旧调用栈的 execute() —— 内部消费 execute_stream
@@ -304,29 +313,19 @@ class ReActStrategy(BaseStrategy):
         session_id: str,
         status_callback: Optional[Callable],
     ) -> List[Dict]:
-        """
-        【reactive compact 入口】上下文超长异常恢复时使用。
+        """【reactive compact 入口】上下文超长异常恢复时使用。
 
-        与 stage_1 的区别：不检查阈值，强制压缩。
-        一期实现：直接降低阈值再调一次 compress_if_overflow（保证一定触发）。
+        与 stage_1 的区别：跳过阈值检查，强制 L5 执行。
         """
         from harness_lite.tools.bash_terminal import process_manager
         active_shell = process_manager.get_shell(session_id)
         current_terminal_cwd = active_shell.last_known_cwd if active_shell else "/"
-
-        # 临时降阈值强制触发压缩
-        original_threshold = self.context_manager.max_allowed_tokens
-        try:
-            self.context_manager.max_allowed_tokens = 100  # 极低阈值，强制压缩
-            compressed = await self.context_manager.compress_if_overflow(
-                messages=messages,
-                engine=engine,
-                current_cwd=current_terminal_cwd,
-                status_callback=status_callback,
-            )
-            return compressed
-        finally:
-            self.context_manager.max_allowed_tokens = original_threshold
+        return await self.context_manager.pipeline.force_compact(
+            messages,
+            engine=engine,
+            current_cwd=current_terminal_cwd,
+            status_callback=status_callback,
+        )
 
     async def _stage_3_tool_orchestration(
         self,
@@ -379,11 +378,13 @@ class ReActStrategy(BaseStrategy):
                     + f"\n\n...[内容过长: 剩余 {len(content) - MAX_SINGLE_OUTPUT_LIMIT} 字符已被系统强制截断]..."
                 )
 
-            messages.append({
+            tool_msg = {
                 "role": "tool",
                 "tool_call_id": result.get("tool_call_id"),
                 "content": content,
-            })
+            }
+            tool_msg = self.context_manager.pipeline.record_tool_result(tool_msg, session_id)
+            messages.append(tool_msg)
 
         if not has_error_in_this_step and valid_tool_calls and status_callback:
             status_callback("[✅ 已完成] 阶段工具数据回传成功，交由主模型总结...")

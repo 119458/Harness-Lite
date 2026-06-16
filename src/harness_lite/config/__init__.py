@@ -9,6 +9,7 @@ from .loader import (
     get_llm_config,
     reload_config,
 )
+from .model_registry import resolve_context_window
 
 __all__ = [
     "get_main_config",
@@ -16,4 +17,5 @@ __all__ = [
     "get_small_config",
     "get_llm_config",
     "reload_config",
+    "resolve_context_window",
 ]

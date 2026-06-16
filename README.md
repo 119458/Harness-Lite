@@ -88,6 +88,14 @@ Harness-Lite 借鉴了 **OpenHarness** 项目（遵循 [MIT License](https://ope
 - 后续可根据不同场景切换不同的模型，当前还没有添加切换模型的操作
 - /model只能展示当前有哪些模型
 
+### 🚀 对上下文进行管理
+- 对上下文进行划分，分为5层
+- tool返回结果>5000进行截断
+- snip(手动截断)--(以实现但需要用户手动截断不支持自动截断)
+- micro-compact(当token>60或tool工具大于60分钟对其进行处理)
+- context collapse(接口实现，但功能未实现)
+- auto-compact(全量压缩)
+
 
 ## 架构
 

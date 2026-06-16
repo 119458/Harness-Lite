@@ -7,7 +7,6 @@ from .query_engine import QueryEngine, TurnResult
 from .streaming_executor import StreamingExecutor
 from .hooks import hook_registry, PostSamplingHook, StopHook
 from . import messages
-from . import compaction
 
 __all__ = [
     "AsyncLoopEngine",
@@ -20,5 +19,4 @@ __all__ = [
     "PostSamplingHook",
     "StopHook",
     "messages",
-    "compaction",
 ]
