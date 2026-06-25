@@ -1,7 +1,7 @@
 """
 Strategy module for agent execution flow.
 
-Upgraded into 4 distinct industrial stages inspired by Anthropic Claude Code.
+Upgraded into 4 distinct industrial stages inspired by modern agent frameworks.
 
 阶段 C 重构要点（master.md 4.3）：
 - 新增 `execute_stream()` AsyncGenerator：逐步 yield LoopMessage
@@ -144,7 +144,7 @@ class ReActStrategy(BaseStrategy):
         full_response = ""
         last_assistant_message: Optional[Dict[str, Any]] = None
         terminal: Optional[Terminal] = None
-        terminated_normally = False
+        recall_attempted = False
 
         try:
             while step < self.max_steps:
@@ -214,10 +214,13 @@ class ReActStrategy(BaseStrategy):
 
                 # ---- STAGE 3: 工具调用分支 ----
                 if tool_calls:
+                    should_recall = not recall_attempted
                     messages, has_error = await self._stage_3_tool_orchestration(
                         messages, tool_calls, engine, session_id,
                         assistant_content, assistant_message, status_callback,
+                        should_recall=should_recall,
                     )
+                    recall_attempted = True
 
                     if has_error:
                         n = budget.record_tool_error()
@@ -244,6 +247,11 @@ class ReActStrategy(BaseStrategy):
                 await self._stage_4_state_persistence(
                     messages, assistant_content, assistant_message, engine, session_id
                 )
+                # 长期记忆后台抽取：信息量累积触发；失败不影响主流程
+                try:
+                    engine.memory.long_term.trigger_extraction(messages, session_id)
+                except Exception as exc:
+                    logger.warning(f"[strategy] trigger_extraction failed: {exc}")
                 yield AssistantMessage(
                     content=full_response,
                     reasoning_content=assistant_message.get("reasoning_content"),
@@ -336,8 +344,19 @@ class ReActStrategy(BaseStrategy):
         assistant_content: str,
         assistant_message: Dict,
         status_callback: Optional[Callable],
+        should_recall: bool = True,
     ) -> tuple[List[Dict], bool]:
-        """【STAGE 3】工具异步编排与自愈层：负责工具并发调度及 Fail-Fast 级联中断。"""
+        """【STAGE 3】工具异步编排与自愈层：负责工具并发调度及 Fail-Fast 级联中断。
+
+        本阶段始终执行工具；长期记忆相关性筛选仅在同一个 ReAct 执行中的首次
+        tool_calls 分支触发一次，后续工具分支不再重复召回。
+
+        两者 gather 完成后再统一收尾：
+        - 工具结果按顺序 append 到 messages；
+        - 用最新 read_set 后置过滤本轮工具刚读过的记忆；
+        - 若仍有推荐项，以 `role=system, is_meta=True` 追加到 messages 尾部，
+          这样下一轮主模型能看到推荐；下一个 user turn 的历史过滤会丢弃它。
+        """
 
         valid_tool_calls = [tc for tc in tool_calls if tc.get("function", {}).get("name")]
         if valid_tool_calls and status_callback:
@@ -353,7 +372,47 @@ class ReActStrategy(BaseStrategy):
             assistant_payload["reasoning_content"] = assistant_message["reasoning_content"]
         messages.append(assistant_payload)
 
-        tool_results = await engine.process_tool_calls_async(tool_calls, session_id)
+        # —— 准备并行召回任务（与工具执行同时启动）——
+        current_tool_names = [tc["function"]["name"] for tc in valid_tool_calls]
+        try:
+            history_tool_names = engine._collect_recent_tools(session_id)
+        except Exception:
+            history_tool_names = []
+        # 去重保序：历史在前，本轮在后
+        recent_tools = list(dict.fromkeys([*history_tool_names, *current_tool_names]))
+        recall_query = self._build_memory_recall_query(
+            messages, assistant_content, current_tool_names,
+        )
+
+        recalled_headers: List[Any] = []
+        tool_task = engine.process_tool_calls_async(tool_calls, session_id)
+
+        if should_recall:
+            recall_task = engine.memory.long_term.async_filter_recommendations(
+                query=recall_query,
+                session_id=session_id,
+                recent_tools=recent_tools,
+            )
+            try:
+                tool_results, recalled_headers = await asyncio.gather(
+                    tool_task, recall_task
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # 召回失败已在 async_filter_recommendations 内部兜底为 []，理论不会到这里。
+                # 若仍异常（如 process_tool_calls_async 抛错），由外层 try 处理。
+                logger.warning("[strategy] tool/recall gather 异常: %s", exc)
+                raise
+        else:
+            try:
+                tool_results = await tool_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("[strategy] tool execution 异常: %s", exc)
+                raise
+
         has_error_in_this_step = False
 
         for result in tool_results:
@@ -386,9 +445,74 @@ class ReActStrategy(BaseStrategy):
             tool_msg = self.context_manager.pipeline.record_tool_result(tool_msg, session_id)
             messages.append(tool_msg)
 
+        # —— read_set 后置过滤：工具执行时可能 read_file 刚读过某记忆 ——
+        try:
+            recall_text = self._build_filtered_recall_text(
+                engine, session_id, recalled_headers,
+            )
+        except Exception as exc:
+            logger.debug("[strategy] 长期记忆推荐渲染失败: %s", exc)
+            recall_text = ""
+
+        # 必须在所有 tool messages append 之后再注入，避免破坏 assistant.tool_calls 配对
+        if recall_text:
+            messages.append({
+                "role": "system",
+                "content": recall_text,
+                "is_meta": True,
+            })
+
         if not has_error_in_this_step and valid_tool_calls and status_callback:
             status_callback("[✅ 已完成] 阶段工具数据回传成功，交由主模型总结...")
         return messages, has_error_in_this_step
+
+    @staticmethod
+    def _build_filtered_recall_text(
+        engine: Any,
+        session_id: str,
+        recalled_headers: List[Any],
+    ) -> str:
+        """后置过滤已读记忆，渲染成功后登记为已注入已读。"""
+        read_set = engine.memory.long_term.get_read_set(session_id)
+        headers = [
+            h for h in (recalled_headers or []) if h.filename not in read_set
+        ]
+        recall_text = engine.memory.long_term.build_recommendation_section(headers)
+        if not recall_text:
+            return ""
+        for h in headers:
+            engine.memory.long_term.mark_read(h.filename, session_id)
+        return recall_text
+
+    @staticmethod
+    def _build_memory_recall_query(
+        messages: List[Dict],
+        assistant_content: str,
+        tool_names: List[str],
+    ) -> str:
+        """拼装小模型筛选用的查询文本。
+
+        组成：最近一条 user 消息 + 当前 assistant 推理片段 + 当前正在调用的工具名。
+        失败时退化为 assistant_content 单独构成的查询。
+        """
+        try:
+            last_user = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    content = m.get("content")
+                    if isinstance(content, str):
+                        last_user = content
+                    break
+            parts = []
+            if last_user:
+                parts.append(f"用户最近请求：{last_user}")
+            if assistant_content:
+                parts.append(f"模型当前推理：{assistant_content}")
+            if tool_names:
+                parts.append(f"本轮工具：{', '.join(tool_names)}")
+            return "\n\n".join(parts) if parts else assistant_content
+        except Exception:
+            return assistant_content or ""
 
     async def _stage_4_state_persistence(
         self,

@@ -26,8 +26,7 @@ class PromptContext:
     enabled_tools: Tuple[str, ...]
     tools_schema_json: str
     skills_list: Tuple[dict, ...] = field(default_factory=tuple)
-    memory_text: str = ""
-    mem0_enabled: bool = False
+    long_term_memory_text: str = ""
     cwd: str = ""
     is_git: bool = False
     platform: str = ""

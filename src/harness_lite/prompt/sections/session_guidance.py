@@ -8,7 +8,7 @@ from harness_lite.prompt.context import PromptContext
 
 _TEXT = """# 当前会话提示
 - 当前由 Harness-Lite CLI 驱动，交互模式下可用斜杠命令：
-  `/model` `/tool` `/skill` `/mem0` `/clear` `/session` `/sandbox` `/exit`
+  `/model` `/tool` `/skill` `/memory` `/clear` `/session` `/sandbox` `/exit`
 - 若你需要用户在 shell 里手动执行某条命令（如交互式登录），请提示用户在输入框前加 `!`，
   例如：`! gcloud auth login`，命令输出将直接进入对话。
 - 当用户输入 `/技能名` 时，请通过 `read_skill` 工具读取对应 SKILL.md 后再执行；

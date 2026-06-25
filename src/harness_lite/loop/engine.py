@@ -77,7 +77,7 @@ class AsyncLoopEngine:
         self.cache = get_default_cache()
 
         # 一次性注册：当 MemoryManager.clear_context 被触发时同步清缓存，
-        # 避免新会话仍然读到旧的 memory_recall 段
+        # 避免新会话仍然读到旧的 long_term_memory 段
         try:
             self.memory.register_invalidation_callback(
                 lambda reason: self.cache.clear(reason)
@@ -93,6 +93,29 @@ class AsyncLoopEngine:
                 lambda reason: pipeline.reset_session(reason)
             )
         except AttributeError:
+            pass
+
+        # 注册长期记忆已读 set 清理回调：clear_context 时同步丢弃所有 session 的已读记录
+        # 简化：reason=clear_context 时清空全部 session 的已读 set（重置最干净）
+        try:
+            self.memory.register_invalidation_callback(
+                lambda reason: self._on_memory_invalidation(reason)
+            )
+        except AttributeError:
+            pass
+
+    def _on_memory_invalidation(self, reason: str) -> None:
+        """记忆失效回调：仅在记忆物理清空(memory_clear)时重置全部 session 状态。
+
+        clear_context 是单 session 级失效，已由 MemoryManager.clear_context 直接调用
+        long_term.clear_read_set(session_id) 完成当前 session 清理，
+        这里不再做全局重置，避免误伤其他活跃 session 的 read_set/counter。
+        """
+        if reason != "memory_clear":
+            return
+        try:
+            self.memory.long_term.reset_all_session_state()
+        except Exception:
             pass
 
     async def run(self, task: str, session_id: str = "default", stream_callback: Callable[[str], None] = None,
@@ -134,7 +157,11 @@ class AsyncLoopEngine:
 
         skills_list = self._collect_skills_list()
         sandbox_roots = tuple(sorted(str(r) for r in self.security.active_sandbox_roots))
-        memory_text = self.memory.load_markdown_memories_as_text(session_id, current_task=task)
+        # 每轮 system prompt 只装载指南 + MEMORY.md 索引；
+        # 推荐清单改由 strategy 在 tool_calls 分支并行筛选后追加为临时 system meta。
+        long_term_memory_text = self.memory.long_term.build_recall_payload(
+            session_id=session_id,
+        )
 
         try:
             # TODO(三模型差异化): 后续可切换为 get_small_config() / get_medium_config()
@@ -150,8 +177,7 @@ class AsyncLoopEngine:
             enabled_tools=enabled_tools,
             tools_schema_json=tools_schema_json,
             skills_list=skills_list,
-            memory_text=memory_text,
-            mem0_enabled=bool(getattr(self.memory, "use_mem0", False)),
+            long_term_memory_text=long_term_memory_text,
             cwd=self._safe_cwd(),
             is_git=self._detect_git(),
             platform=_platform_mod.system(),
@@ -174,6 +200,31 @@ class AsyncLoopEngine:
             )
             items.append({"name": name, "description": desc})
         return tuple(items)
+
+    def _collect_recent_tools(self, session_id: str) -> List[str]:
+        """从短期 JSON 上下文取最近 N 条消息，提取 assistant.tool_calls 的工具名。
+
+        用于召回小模型过滤"正在用的工具的用法说明类记忆"。
+        """
+        try:
+            from harness_lite.memory.long_term import RECENT_TOOLS_WINDOW
+            history = self.memory.load_context(session_id) or []
+            recent = history[-RECENT_TOOLS_WINDOW:]
+            names = []
+            for m in recent:
+                if m.get("role") != "assistant":
+                    continue
+                tcs = m.get("tool_calls") or []
+                if not isinstance(tcs, list):
+                    continue
+                for tc in tcs:
+                    fn = (tc or {}).get("function") or {}
+                    nm = fn.get("name")
+                    if nm and nm not in names:
+                        names.append(nm)
+            return names
+        except Exception:
+            return []
 
     @staticmethod
     def _safe_cwd() -> str:
@@ -537,12 +588,52 @@ class AsyncLoopEngine:
 
         try:
             result = tool.execute(**tool_args)
-            return str(result)
+            result_str = str(result)
+            # 长期记忆 read_file 已读去重：仅当工具是 read_file 且路径在 long_term 目录下时记录
+            self._maybe_mark_long_term_read(tool_name, tool_args, result_str, session_id)
+            return result_str
         except Exception as e:
             import traceback
             error_stack = traceback.format_exc().strip().split("\n")[-2:]
             stack_str = ' '.join(error_stack)
             return f"[Execution Error] 工具执行时抛出代码异常: {str(e)}。详细信息: {stack_str}。"
+
+    # 用于过滤工具失败结果的精确前缀（避免把以 [Security... 开头的合法内容误判为错误）
+    _LONG_TERM_READ_ERROR_PREFIXES = (
+        "[Security Blocked]",
+        "[Tool Not Found]",
+        "[Execution Error]",
+    )
+
+    def _maybe_mark_long_term_read(
+        self, tool_name: str, tool_args: Dict[str, Any], result_str: str, session_id: str,
+    ) -> None:
+        """若工具是 read_file 且读取的文件位于 long_term/ 目录下，则登记为已读。
+
+        失败仅 debug log，绝不让记忆模块影响主工具流。
+        """
+        if tool_name != "read_file":
+            return
+        if result_str.startswith(self._LONG_TERM_READ_ERROR_PREFIXES):
+            return
+        try:
+            file_path = tool_args.get("file_path") or tool_args.get("path")
+            if not file_path:
+                return
+            base = self.memory.long_term.base_dir
+            target = Path(file_path).expanduser().resolve()
+            try:
+                rel = target.relative_to(base)
+            except ValueError:
+                return
+            filename = str(rel)
+            self.memory.long_term.mark_read(filename, session_id)
+        except Exception as exc:
+            # 静默吞掉：长期记忆维护失败不应干扰工具结果
+            import logging as _logging
+            _logging.getLogger("harness_lite.loop.engine").debug(
+                "mark_read failed: %s", exc
+            )
 
     def _get_all_tools_schema(self) -> List[Dict[str, Any]]:
         return self.registry.get_all_schemas()

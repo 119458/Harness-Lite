@@ -102,7 +102,7 @@ class AttachmentMessage:
 
     subtype:
     - "skill_prefetch"   → skill 预取结果，注入 system
-    - "memory_prefetch"  → mem0/markdown 长记忆注入
+    - "memory_prefetch"  → 长期记忆召回结果注入（文件型分类型系统）
     - "max_turns_reached"→ 达到 max_turns 时的提示
     - "hook_stopped"     → stop hook 阻止继续的占位
     """

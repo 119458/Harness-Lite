@@ -95,11 +95,14 @@ class ContextCollapse:
     """L4：每次发往 LLM 前对 messages 做单层深拷贝投影，权威历史不动。
 
     职责：
-    - 剥离内部字段（_meta_id 等不应外泄给 LLM 的字段）
+    - 剥离内部字段（_meta_id / is_meta 等不应外泄给 LLM 的字段）
     - 非 thinking_mode 时移除 reasoning_content
     - 清理 assistant 的空 tool_calls
     - 合并相邻的 system 锚点为一条
     """
+
+    # 不应外泄给 LLM 的内部字段集合
+    _INTERNAL_FIELDS = (META_ID_KEY, "is_meta")
 
     def project(
         self,
@@ -111,7 +114,9 @@ class ContextCollapse:
         for m in messages:
             # 深拷贝单条消息，确保后续 SDK 序列化或调用方意外修改投影副本时
             # 不会回污染权威历史（tool_calls 等嵌套结构必须独立副本）。
-            mm = copy.deepcopy({k: v for k, v in m.items() if k != META_ID_KEY})
+            mm = copy.deepcopy(
+                {k: v for k, v in m.items() if k not in self._INTERNAL_FIELDS}
+            )
             if not thinking_mode and "reasoning_content" in mm:
                 del mm["reasoning_content"]
             if mm.get("role") == "assistant" and mm.get("tool_calls") in (None, []):

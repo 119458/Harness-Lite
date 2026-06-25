@@ -107,7 +107,8 @@ class SecurityManager:
         self._audit_log: list = []
         self.whitelist = Whitelist()
         current_file = Path(__file__).resolve()
-        project_root = current_file.parent.parent.parent.parent
+        self.project_root = current_file.parent.parent.parent.parent
+        project_root = self.project_root
         workspace_env = os.environ.get("WORKSPACE_ROOT")
         self.active_sandbox_roots: Set[Path] = set()
         if workspace_env:
@@ -116,6 +117,10 @@ class SecurityManager:
                     self.active_sandbox_roots.add(Path(p.strip()).resolve())
         else:
             self.active_sandbox_roots.add((project_root / "sandbox").resolve())
+
+        # 长期记忆目录始终授信，使模型可写入分类记忆文件
+        long_term_dir = (project_root / "memory_store" / "long_term").resolve()
+        self.active_sandbox_roots.add(long_term_dir)
 
         for r in self.active_sandbox_roots:
             r.mkdir(parents=True, exist_ok=True)
@@ -152,6 +157,10 @@ class SecurityManager:
                 current_file = Path(__file__).resolve()
                 project_root = current_file.parent.parent.parent.parent
                 self.active_sandbox_roots.add((project_root / "sandbox").resolve())
+            # 长期记忆目录无论 reset 走 .env 还是默认底座，都始终保持授信
+            self.active_sandbox_roots.add(
+                (self.project_root / "memory_store" / "long_term").resolve()
+            )
             return
         if paths[0] in ("remove", "-r") and len(paths) > 1:
             for p in paths[1:]:
@@ -187,7 +196,11 @@ class SecurityManager:
         try:
             p = Path(target_path)
             if not p.is_absolute():
-                resolved_path = (self.get_session_workspace(session_id) / p).resolve()
+                if self._is_long_term_relative_path(p):
+                    normalized_parts = ("memory_store", "long_term", *p.parts[2:])
+                    resolved_path = (self.project_root / Path(*normalized_parts)).resolve()
+                else:
+                    resolved_path = (self.get_session_workspace(session_id) / p).resolve()
             else:
                 resolved_path = p.resolve()
             if not self.is_path_safe(resolved_path):
@@ -195,6 +208,15 @@ class SecurityManager:
             return True, str(resolved_path)
         except Exception as e:
             return False, f"Path Resolution Error: ({str(e)})"
+
+    @staticmethod
+    def _is_long_term_relative_path(path: Path) -> bool:
+        """识别 memory_store/long_term 相对路径，兼容大小写不敏感文件系统。"""
+        return (
+            len(path.parts) >= 2
+            and path.parts[0].lower() == "memory_store"
+            and path.parts[1].lower() == "long_term"
+        )
 
     def _validate_layer1_static(self, tool_name: str, input_data: Dict[str, Any], session_id: str) -> Tuple[bool, str]:
         if tool_name in ["read_file", "create_file", "edit_file"]:
@@ -486,30 +508,6 @@ class SecurityManager:
                 human_passed = self._human_audit(tool_name, input_data, reason)
                 if not human_passed:
                     self.audit_log("deny", tool_name, user_id, "Layer 3 Human Denied")
-
-                    # 联动触发长期记忆自愈提炼
-                    try:
-                        from harness_lite.memory.manager import MemoryManager
-                        mem_manager = MemoryManager()
-
-                        failed_command = ""
-                        if tool_name == "bash_terminal":
-                            failed_command = input_data.get("command", "")
-                        elif tool_name == "python_interpreter":
-                            failed_command = input_data.get("code", "")
-                        else:
-                            failed_command = json.dumps(input_data, ensure_ascii=False)
-
-                        correction_context = f"人类用户在 Layer 3 交互界面明确按了 [N] 键拒绝放行。拦截理由: {reason}"
-
-                        mem_manager.distill_and_record_correction(
-                            session_id=user_id,
-                            failed_command=failed_command,
-                            correction_context=correction_context
-                        )
-                    except Exception as e:
-                        print(f"[Memory System Warning] 触发纠错记忆动态提炼时发生异常: {str(e)}")
-
                     return False, f"[Security Blocked] [User Interrupted] 人类用户在最终审查层强制拒绝了执行。原因: 该操作具有潜在系统环境隐患。请更换一种更加温和、不触及敏感状态的全新策略来实现目标。"
 
         self.audit_log("allow", tool_name, user_id, "passed all layers")

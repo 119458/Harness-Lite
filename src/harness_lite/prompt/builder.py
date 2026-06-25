@@ -19,7 +19,7 @@ from harness_lite.prompt.sections import (
     doing_tasks,
     environment,
     intro,
-    memory_recall,
+    long_term_memory,
     session_guidance,
     skills_catalog,
     system_rules,
@@ -62,7 +62,7 @@ class PromptBuilder:
         ("environment", environment.compute),
         ("tools_catalog", tools_catalog.compute),
         ("skills_catalog", skills_catalog.compute),
-        ("memory_recall", memory_recall.compute),
+        ("long_term_memory", long_term_memory.compute),
     ]
 
     def __init__(self, ctx: PromptContext, cache: SectionCache) -> None:

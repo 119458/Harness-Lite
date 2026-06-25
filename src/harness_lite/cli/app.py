@@ -49,7 +49,7 @@ class CommandCompleter(Completer):
             "/model": "查看 LLM 服务配置",
             "/tool": "列出已注册工具",
             "/skill": "列出已加载技能",
-            "/mem0": "切换 mem0 长记忆",
+            "/memory": "列出记忆或清空记忆",
             "/clear": "清空当前会话上下文",
             "/session": "查看会话与沙箱信息",
             "/sandbox": "动态挂载沙箱目录（多路径以空格分隔）",
@@ -195,13 +195,6 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
                 )
             console.print(_panel("\n".join(lines), f"Skills ({len(all_skills)})"))
 
-    elif cmd == "/mem0":
-        try:
-            status_msg = engine.memory.toggle_mem0()
-            console.print(status_msg)
-        except Exception as e:
-            console.print(f"[red]error:[/red] mem0 toggle failed: {e}")
-
     elif cmd == "/clear":
         try:
             engine.memory.clear_context(session_id)
@@ -210,6 +203,38 @@ async def handle_slash_command(command_str: str, session_id: str, engine: AsyncL
             console.print(f"[cyan]✓[/cyan] context cleared [dim](session={session_id})[/dim]")
         except Exception as e:
             console.print(f"[red]error:[/red] clear failed: {e}")
+
+    elif cmd == "/memory":
+        if len(parts) > 1 and parts[1] == "clear":
+            try:
+                from prompt_toolkit.shortcuts import confirm
+                should_clear = await asyncio.to_thread(
+                    confirm, "确认要清空所有长期记忆吗？"
+                )
+            except Exception as e:
+                console.print(f"[red]error:[/red] confirmation failed: {e}")
+                return False
+            if should_clear:
+                count = engine.memory.long_term.clear_all()
+                console.print(f"[cyan]✓[/cyan] 已清除 {count} 条长期记忆")
+            else:
+                console.print("[dim]已取消。[/dim]")
+        else:
+            headers = engine.memory.long_term.list_memory_headers()
+            if not headers:
+                console.print("[dim]无长期记忆。[/dim]")
+            else:
+                lines = []
+                for idx, h in enumerate(headers, 1):
+                    desc = h.description or "（无描述）"
+                    name = h.name or os.path.splitext(h.filename)[0]
+                    updated_at = h.updated_at or "unknown"
+                    lines.append(
+                        f"  [dim]{idx:02d}[/dim]  "
+                        f"[cyan]{h.type}[/cyan]  {h.filename}  "
+                        f"[dim]name={name} updated_at={updated_at}[/dim]  {desc}"
+                    )
+                console.print(_panel("\n".join(lines), f"Long-term Memory ({len(headers)})"))
 
     elif cmd == "/sandbox":
         from harness_lite.security.manager import security_manager
@@ -446,7 +471,7 @@ async def run_interactive_async(session_id: str) -> None:
     """交互模式：长生命周期会话。"""
     Console().print(f"[dim]session={session_id}  ·  type /exit to quit[/dim]")
 
-    # 单实例 engine，使 memory.use_mem0 等状态跨多轮保留
+    # 单实例 engine，使 long_term_memory 等状态跨多轮保留
     global_engine = AsyncLoopEngine()
     from prompt_toolkit.key_binding import KeyBindings
     kb = KeyBindings()
