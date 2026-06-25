@@ -19,6 +19,7 @@ adopt-code/
 execute_described/
 functional_description/
 CLAUDE.md
+.github/workflows/
 
 # macOS
 .DS_Store
