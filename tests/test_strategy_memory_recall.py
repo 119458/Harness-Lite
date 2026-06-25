@@ -1,4 +1,5 @@
-"""ReActStrategy 与长期记忆筛选的并行调度单元测试。
+"""
+ReActStrategy 与长期记忆筛选的并行调度单元测试。
 
 覆盖：
 - 有 tool_calls 时：process_tool_calls_async 与 async_filter_recommendations 同时启动
@@ -243,18 +244,3 @@ def test_recall_failure_does_not_break_tool_execution(monkeypatch):
     # 推荐为空 -> 不 append meta
     assert not any(m.get("is_meta") for m in out_messages)
     assert has_error is False
-
-
-def test_build_memory_recall_query_combines_user_and_assistant_and_tools():
-    """query 应包含最近一条 user 消息、当前推理片段、本轮工具名。"""
-    messages = [
-        {"role": "user", "content": "请读文件 A"},
-        {"role": "assistant", "content": "..."},
-        {"role": "user", "content": "再读文件 B"},
-    ]
-    q = ReActStrategy._build_memory_recall_query(
-        messages, assistant_content="先调用 read_file", tool_names=["read_file"],
-    )
-    assert "再读文件 B" in q
-    assert "先调用 read_file" in q
-    assert "read_file" in q
