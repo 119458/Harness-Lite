@@ -1,0 +1,44 @@
+name: Harness Lite CI
+
+# 触发条件：当向 main 或 master 分支进行 push 或提交 PR 时触发
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 1. 拉取仓库代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 设置 Python 环境
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    # 3. 缓存 pip 依赖（利用 pyproject.toml 的变化来决定是否刷新缓存）
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('pyproject.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    # 4. 一键安装核心依赖 + 开发测试依赖
+    # 这里利用了你 pyproject.toml 中定义的依赖项与打包规则
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    # 5. 运行测试
+    - name: Run Tests with Pytest
+      run: |
+        pytest tests/
